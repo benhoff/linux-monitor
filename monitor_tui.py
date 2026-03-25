@@ -26,6 +26,7 @@ TAB_TITLES = {
     "tier3": "Tier 3",
 }
 PACKAGE_REFRESH_INTERVAL = 900
+DIFF_SNAPSHOT_INTERVAL = 120
 DEFAULT_PRIVILEGED_SNAPSHOT = "/run/monitor/privileged_snapshot.json"
 PSEUDO_FILESYSTEMS = {
     "autofs",
@@ -186,6 +187,20 @@ def format_percent(numerator: float, denominator: float) -> str:
     return f"{(numerator / denominator) * 100:.1f}%"
 
 
+def format_duration_compact(seconds: int | float) -> str:
+    total = max(int(seconds), 0)
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
 def shorten(value: str, limit: int = 120) -> str:
     if len(value) <= limit:
         return value
@@ -305,6 +320,327 @@ class MonitorBackend:
         timestamp = datetime.fromtimestamp(generated).strftime("%H:%M:%S")
         age = max(int(time.time() - generated), 0)
         return f"Privileged snapshot: {timestamp} ({age}s ago)"
+
+    @staticmethod
+    def _diff_snapshot_path() -> Path:
+        override = os.environ.get("MONITOR_DIFF_SNAPSHOT")
+        if override:
+            return Path(override)
+        state_root = os.environ.get("XDG_STATE_HOME")
+        if state_root:
+            return Path(state_root) / "monitor" / "diff_snapshot.json"
+        return Path.cwd() / ".monitor_state" / "diff_snapshot.json"
+
+    def _load_diff_snapshot(self) -> dict[str, object] | None:
+        path = self._diff_snapshot_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if isinstance(data, dict):
+            return data
+        return None
+
+    def _write_diff_snapshot(self, payload: dict[str, object]) -> None:
+        path = self._diff_snapshot_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _age_label(seconds: int) -> str:
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m"
+        return f"{seconds // 3600}h"
+
+    def _current_state_digest(self) -> dict[str, object]:
+        return self.cached("current_state_digest", 10.0, self._build_state_digest)
+
+    def _build_state_digest(self) -> dict[str, object]:
+        now = time.time()
+        installed = self.cached("installed_packages", 30.0, self._installed_packages)
+        with self.package_lock:
+            package_state = PackageRefreshState(
+                loading=self.package_state.loading,
+                last_updated=self.package_state.last_updated,
+                official_updates=dict(self.package_state.official_updates),
+                aur_updates=dict(self.package_state.aur_updates),
+                official_error=self.package_state.official_error,
+                aur_error=self.package_state.aur_error,
+            )
+
+        kernel_updates = {**package_state.aur_updates, **package_state.official_updates}
+        tracked_rows = [
+            *self._tracked_kernel_packages(installed),
+            *self._tracked_firmware_versions(installed),
+            *self._tracked_nvidia_packages(installed),
+        ]
+        tracked_outdated = sum(
+            1
+            for name, version in tracked_rows
+            if (latest := self._latest_version_for(name, kernel_updates)) is not None and latest != version
+        )
+
+        fs_entries = self._filesystem_usage()
+        inode_usage = self._inode_usage()
+        dir_sizes = self.cached("dir_sizes", 300.0, self._directory_sizes)
+        root_entry = next((entry for entry in fs_entries if entry["target"] == "/"), None)
+        healthy_count = 0
+        watch_count = 0
+        critical_count = 0
+        for entry in fs_entries:
+            severity = self._storage_severity(int(entry["pct"]), inode_usage.get(str(entry["target"])))
+            if severity == "critical":
+                critical_count += 1
+            elif severity == "watch":
+                watch_count += 1
+            else:
+                healthy_count += 1
+
+        privileged_systemd = self._privileged_section("systemd")
+        system_state = "unknown"
+        failed_services = None
+        if privileged_systemd:
+            system_state = str(privileged_systemd.get("state", "unknown"))
+            failed = privileged_systemd.get("failed_services", [])
+            failed_services = len(failed) if isinstance(failed, list) else None
+        else:
+            system_state = self._systemd_state()
+            failed_services = len(self._failed_services())
+
+        privileged_logs = self._privileged_section("logs")
+        journal_error_count = None
+        if privileged_logs:
+            errors = privileged_logs.get("journal_errors", [])
+            journal_error_count = len(errors) if isinstance(errors, list) else None
+
+        meminfo = self._meminfo()
+        mem_total = meminfo.get("MemTotal", 0) * 1024
+        mem_available = meminfo.get("MemAvailable", 0) * 1024
+        mem_used = max(mem_total - mem_available, 0)
+        psi = self._psi(Path("/proc/pressure/memory"))
+        psi_full10 = float(psi.get("full", {}).get("avg10", 0.0))
+
+        max_temp = 0.0
+        for item in self._thermal_zones():
+            match = re.search(r"(-?\d+(?:\.\d+)?)\s*C", item)
+            if match:
+                max_temp = max(max_temp, float(match.group(1)))
+
+        growth = {
+            self._abbreviate_path(path): size
+            for path, size in dir_sizes[:5]
+        }
+
+        return {
+            "captured_at": now,
+            "packages": {
+                "repo_pending": None if package_state.official_error else len(package_state.official_updates),
+                "aur_pending": None if package_state.aur_error else len(package_state.aur_updates),
+                "tracked_outdated": tracked_outdated,
+            },
+            "storage": {
+                "root_pct": int(root_entry["pct"]) if root_entry else None,
+                "root_free": int(root_entry["avail"]) if root_entry else None,
+                "healthy_count": healthy_count,
+                "watch_count": watch_count,
+                "critical_count": critical_count,
+                "growth": growth,
+            },
+            "systemd": {
+                "state": system_state,
+                "failed_services": failed_services,
+            },
+            "logs": {
+                "journal_errors": journal_error_count,
+            },
+            "memory": {
+                "used_pct": (mem_used / mem_total * 100.0) if mem_total else None,
+                "psi_full10": psi_full10,
+            },
+            "thermal": {
+                "max_temp_c": max_temp if max_temp > 0 else None,
+            },
+        }
+
+    def collect_diff_snapshot(self) -> list[str]:
+        current = self._current_state_digest()
+        previous = self._load_diff_snapshot()
+        lines: list[str] = []
+
+        if not previous:
+            lines.append("No prior diff snapshot yet. A baseline will be written automatically.")
+            self._write_diff_snapshot(current)
+            return lines
+
+        captured_at = previous.get("captured_at")
+        if isinstance(captured_at, (int, float)):
+            age = max(int(current["captured_at"] - captured_at), 0)
+            lines.append(f"Compared with {self._age_label(age)} ago")
+        else:
+            lines.append("Compared with previous snapshot")
+
+        changes: list[str] = []
+        current_packages = current.get("packages", {})
+        previous_packages = previous.get("packages", {})
+        if isinstance(current_packages, dict) and isinstance(previous_packages, dict):
+            current_total = None
+            previous_total = None
+            if isinstance(current_packages.get("repo_pending"), int) and isinstance(current_packages.get("aur_pending"), int):
+                current_total = int(current_packages["repo_pending"]) + int(current_packages["aur_pending"])
+            if isinstance(previous_packages.get("repo_pending"), int) and isinstance(previous_packages.get("aur_pending"), int):
+                previous_total = int(previous_packages["repo_pending"]) + int(previous_packages["aur_pending"])
+            if current_total is not None and previous_total is not None and current_total != previous_total:
+                delta = current_total - previous_total
+                changes.append(f"Packages: {delta:+d} pending updates ({current_total} now)")
+            current_tracked = current_packages.get("tracked_outdated")
+            previous_tracked = previous_packages.get("tracked_outdated")
+            if isinstance(current_tracked, int) and isinstance(previous_tracked, int) and current_tracked != previous_tracked:
+                delta = current_tracked - previous_tracked
+                changes.append(f"Tracked critical packages: {delta:+d} outdated ({current_tracked} now)")
+
+        current_storage = current.get("storage", {})
+        previous_storage = previous.get("storage", {})
+        if isinstance(current_storage, dict) and isinstance(previous_storage, dict):
+            current_root_pct = current_storage.get("root_pct")
+            previous_root_pct = previous_storage.get("root_pct")
+            if isinstance(current_root_pct, int) and isinstance(previous_root_pct, int) and current_root_pct != previous_root_pct:
+                changes.append(f"Root usage: {current_root_pct - previous_root_pct:+d}% ({current_root_pct}% now)")
+            current_root_free = current_storage.get("root_free")
+            previous_root_free = previous_storage.get("root_free")
+            if isinstance(current_root_free, int) and isinstance(previous_root_free, int):
+                delta = current_root_free - previous_root_free
+                if abs(delta) >= 1024**3:
+                    changes.append(f"Root free space: {format_bytes(delta)} change ({format_bytes(current_root_free)} now)")
+            current_growth = current_storage.get("growth", {})
+            previous_growth = previous_storage.get("growth", {})
+            if isinstance(current_growth, dict) and isinstance(previous_growth, dict):
+                growth_deltas = []
+                for path, size in current_growth.items():
+                    previous_size = previous_growth.get(path)
+                    if isinstance(size, int) and isinstance(previous_size, int):
+                        delta = size - previous_size
+                        if abs(delta) >= 1024**3:
+                            growth_deltas.append((path, delta))
+                growth_deltas.sort(key=lambda item: abs(item[1]), reverse=True)
+                if growth_deltas:
+                    changes.append(
+                        "Growth: "
+                        + ", ".join(
+                            f"{path} {format_bytes(delta)}"
+                            for path, delta in growth_deltas[:2]
+                        )
+                    )
+
+        current_systemd = current.get("systemd", {})
+        previous_systemd = previous.get("systemd", {})
+        if isinstance(current_systemd, dict) and isinstance(previous_systemd, dict):
+            current_failed = current_systemd.get("failed_services")
+            previous_failed = previous_systemd.get("failed_services")
+            if isinstance(current_failed, int) and isinstance(previous_failed, int) and current_failed != previous_failed:
+                changes.append(f"Failed services: {current_failed - previous_failed:+d} ({current_failed} now)")
+
+        if not changes:
+            lines.append("No high-signal changes since the last diff snapshot.")
+        else:
+            lines.extend(changes[:5])
+
+        if not isinstance(captured_at, (int, float)) or current["captured_at"] - captured_at >= DIFF_SNAPSHOT_INTERVAL:
+            self._write_diff_snapshot(current)
+        return lines
+
+    def collect_top_problems(self) -> list[str]:
+        current = self._current_state_digest()
+        previous = self._load_diff_snapshot()
+        problems: list[tuple[int, str]] = []
+
+        packages = current.get("packages", {})
+        if isinstance(packages, dict):
+            repo_pending = packages.get("repo_pending")
+            aur_pending = packages.get("aur_pending")
+            tracked_outdated = packages.get("tracked_outdated")
+            if isinstance(repo_pending, int) and isinstance(aur_pending, int):
+                pending_total = repo_pending + aur_pending
+                if pending_total > 0:
+                    severity = 90 if pending_total >= 50 else 60
+                    problems.append((severity, f"? {pending_total} pending package updates ({aur_pending} AUR)"))
+            if isinstance(tracked_outdated, int) and tracked_outdated > 0:
+                severity = 95 if tracked_outdated >= 3 else 70
+                problems.append((severity, f"? {tracked_outdated} tracked kernel/firmware/NVIDIA packages are outdated"))
+
+        storage = current.get("storage", {})
+        if isinstance(storage, dict):
+            root_pct = storage.get("root_pct")
+            critical_count = storage.get("critical_count")
+            watch_count = storage.get("watch_count")
+            if isinstance(root_pct, int) and root_pct >= 90:
+                problems.append((100, f"! Root filesystem is {root_pct}% full"))
+            elif isinstance(root_pct, int) and root_pct >= 75:
+                problems.append((70, f"? Root filesystem is {root_pct}% full"))
+            if isinstance(critical_count, int) and critical_count > 0:
+                problems.append((95, f"! {critical_count} filesystems are in critical capacity"))
+            elif isinstance(watch_count, int) and watch_count > 0:
+                problems.append((60, f"? {watch_count} filesystems are approaching capacity"))
+
+        systemd_state = current.get("systemd", {})
+        if isinstance(systemd_state, dict):
+            failed_services = systemd_state.get("failed_services")
+            state_value = str(systemd_state.get("state", "unknown"))
+            if isinstance(failed_services, int) and failed_services > 0:
+                severity = 100 if failed_services >= 3 else 80
+                problems.append((severity, f"! {failed_services} failed services ({state_value})"))
+            elif state_value in {"degraded", "failed"}:
+                problems.append((75, f"? System state is {state_value}"))
+
+        memory = current.get("memory", {})
+        if isinstance(memory, dict):
+            used_pct = memory.get("used_pct")
+            psi_full10 = memory.get("psi_full10")
+            if isinstance(used_pct, (int, float)) and used_pct >= 90:
+                problems.append((85, f"! RAM usage is {used_pct:.0f}%"))
+            if isinstance(psi_full10, (int, float)) and psi_full10 >= 0.1:
+                problems.append((90, f"! Memory full PSI avg10 is {psi_full10:.2f}"))
+            elif isinstance(psi_full10, (int, float)) and psi_full10 > 0.0:
+                problems.append((55, f"? Memory full PSI avg10 is {psi_full10:.2f}"))
+
+        thermal = current.get("thermal", {})
+        if isinstance(thermal, dict):
+            max_temp_c = thermal.get("max_temp_c")
+            if isinstance(max_temp_c, (int, float)) and max_temp_c >= 85:
+                problems.append((85, f"! Max observed system temperature is {max_temp_c:.1f} C"))
+            elif isinstance(max_temp_c, (int, float)) and max_temp_c >= 75:
+                problems.append((55, f"? Max observed system temperature is {max_temp_c:.1f} C"))
+
+        logs = current.get("logs", {})
+        if isinstance(logs, dict):
+            journal_errors = logs.get("journal_errors")
+            if isinstance(journal_errors, int) and journal_errors > 0:
+                severity = 65 if journal_errors < 10 else 80
+                problems.append((severity, f"? Journal shows {journal_errors} error entries this boot"))
+
+        if previous and isinstance(previous, dict):
+            previous_storage = previous.get("storage", {})
+            current_storage = current.get("storage", {})
+            if isinstance(previous_storage, dict) and isinstance(current_storage, dict):
+                current_root_free = current_storage.get("root_free")
+                previous_root_free = previous_storage.get("root_free")
+                if isinstance(current_root_free, int) and isinstance(previous_root_free, int):
+                    delta = current_root_free - previous_root_free
+                    if delta <= -(5 * 1024**3):
+                        problems.append((75, f"? Root free space dropped by {format_bytes(abs(delta))} since the last diff snapshot"))
+
+        if not problems:
+            return ["No major problems detected right now."]
+
+        deduped: list[str] = []
+        for _severity, message in sorted(problems, key=lambda item: item[0], reverse=True):
+            if message not in deduped:
+                deduped.append(message)
+        return deduped[:5]
 
     def start_package_worker(self) -> None:
         if self.package_worker_started:
@@ -1811,8 +2147,23 @@ class MonitorBackend:
         result = run_command(["systemd-analyze", "blame", "--no-pager"], timeout=5.0)
         return line_list(result.stdout, limit=8)
 
+    def _uptime_summary(self) -> str:
+        raw = read_text(Path("/proc/uptime")).strip().split()
+        if not raw:
+            return "Uptime: unavailable"
+        try:
+            uptime_seconds = float(raw[0])
+        except ValueError:
+            return "Uptime: unavailable"
+        booted_at = datetime.fromtimestamp(time.time() - uptime_seconds).strftime("%Y-%m-%d %H:%M")
+        return f"Uptime: {format_duration_compact(uptime_seconds)} | booted {booted_at}"
+
     def collect_boot(self) -> list[str]:
-        lines = [f"Boot time: {self.cached('boot_time', 300.0, self._boot_time)}", "Slowest boot services:"]
+        lines = [
+            self._uptime_summary(),
+            f"Boot time: {self.cached('boot_time', 300.0, self._boot_time)}",
+            "Slowest boot services:",
+        ]
         blame = self.cached("boot_blame", 300.0, self._boot_blame)
         for item in blame[:6]:
             lines.append(f"  {item}")
@@ -1835,6 +2186,8 @@ class DashboardModel:
     def _build_collectors(self) -> list[Collector]:
         backend = self.backend
         return [
+            Collector("top_problems", "tier1", "Top Problems", 15, backend.collect_top_problems),
+            Collector("diff_snapshot", "tier1", "Diff Snapshot", 15, backend.collect_diff_snapshot),
             Collector("packages", "tier1", "Kernel / Firmware / NVIDIA", 5, backend.collect_packages),
             Collector("storage", "tier1", "Storage / Capacity", 20, backend.collect_storage),
             Collector("systemd", "tier1", "Systemd / Service Health", 20, backend.collect_systemd),
@@ -2095,8 +2448,12 @@ class DashboardUI:
             return curses.A_NORMAL
         if stripped.startswith("Privileged snapshot:"):
             return curses.color_pair(7)
+        if stripped.startswith("Compared with"):
+            return curses.color_pair(7)
         if stripped.startswith("! "):
             return curses.color_pair(3) | curses.A_BOLD
+        if stripped.startswith("? "):
+            return curses.color_pair(5) | curses.A_BOLD
         if section == "Logs / Errors" and line.startswith("  ") and stripped != "No matching entries.":
             return curses.color_pair(3)
         if section == "Filesystem Integrity" and line.startswith("  ") and stripped != "No matching entries.":
@@ -2117,6 +2474,12 @@ class DashboardUI:
 
     def _is_ok_line(self, stripped: str, lowered: str, section: str) -> bool:
         if stripped == "No matching entries.":
+            return True
+        if stripped == "No major problems detected right now.":
+            return True
+        if stripped == "No high-signal changes since the last diff snapshot.":
+            return True
+        if stripped.startswith("Uptime:"):
             return True
         if lowered.endswith(" current"):
             return True
