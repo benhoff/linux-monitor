@@ -32,7 +32,7 @@ PACKAGE_REFRESH_INTERVAL = 900
 PACKAGE_METADATA_INTERVAL = 600
 DIFF_SNAPSHOT_INTERVAL = 120
 DEFAULT_PRIVILEGED_SNAPSHOT = "/run/monitor/privileged_snapshot.json"
-PRIVILEGED_SNAPSHOT_VERSION = 2
+PRIVILEGED_SNAPSHOT_VERSION = 3
 DEFAULT_PRIVILEGED_SNAPSHOT_MAX_AGE = 15 * 60
 PRIVILEGED_REFRESH_SCRIPT = "./refresh_monitor_privileged.sh"
 PACKAGE_EST_DOWNLOAD_BYTES_PER_SEC = 10 * 1024 * 1024
@@ -80,6 +80,7 @@ FS_LOG_PATTERN = (
 )
 THROTTLE_LOG_PATTERN = r"throttl|thermal"
 HARDWARE_LOG_PATTERN = r"gpu|drm|hdmi|edid|nvme|ata|usb|pci|v4l2|camera|csi"
+WIFI_LOG_PATTERN = r"wlan|wifi|wireless|wpa_supplicant|NetworkManager|cfg80211|mac80211"
 KERNEL_PACKAGE_NAMES = (
     "linux",
     "linux-lts",
@@ -293,6 +294,16 @@ def parse_int(value: str, default: int = 0) -> int:
     return int(match.group(0))
 
 
+def parse_float(value: str) -> float | None:
+    match = re.search(r"-?\d+(?:\.\d+)?", value)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
 def line_list(text: str, limit: int | None = None) -> list[str]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if limit is not None:
@@ -305,6 +316,206 @@ def journal_line_list(text: str, limit: int | None = None) -> list[str]:
     if limit is not None:
         return lines[:limit]
     return lines
+
+
+def wireless_band_label(frequency_mhz: int | None) -> str | None:
+    if frequency_mhz is None:
+        return None
+    if frequency_mhz >= 5925:
+        return "6 GHz"
+    if frequency_mhz >= 4900:
+        return "5 GHz"
+    if frequency_mhz >= 2400:
+        return "2.4 GHz"
+    return f"{frequency_mhz} MHz"
+
+
+def parse_iw_channel_details(raw: str) -> dict[str, object]:
+    details: dict[str, object] = {}
+    channel_match = re.search(r"\bchannel\s+(\d+)\b", raw)
+    freq_match = re.search(r"\((\d+)\s*MHz\)", raw)
+    width_match = re.search(r"width:\s*([0-9]+)\s*MHz", raw)
+    center1_match = re.search(r"center1:\s*(\d+)", raw)
+    if channel_match:
+        details["channel"] = int(channel_match.group(1))
+    if freq_match:
+        frequency = int(freq_match.group(1))
+        details["frequency_mhz"] = frequency
+        details["band"] = wireless_band_label(frequency)
+    if width_match:
+        details["width_mhz"] = int(width_match.group(1))
+    if center1_match:
+        details["center1_mhz"] = int(center1_match.group(1))
+    return details
+
+
+def parse_iw_rate_mbps(raw: str) -> float | None:
+    match = re.search(r"([0-9]+(?:\.\d+)?)\s*MBit/s", raw)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def parse_proc_net_wireless_text(text: str) -> dict[str, dict[str, object]]:
+    stats: dict[str, dict[str, object]] = {}
+    for raw in text.splitlines()[2:]:
+        if ":" not in raw:
+            continue
+        iface, rest = raw.split(":", 1)
+        fields = rest.split()
+        if len(fields) < 10:
+            continue
+        link = parse_float(fields[1])
+        level = parse_float(fields[2])
+        noise = parse_float(fields[3])
+        if link is None or level is None or noise is None:
+            continue
+        quality_pct = max(0.0, min(link / 70.0 * 100.0, 100.0))
+        stats[iface.strip()] = {
+            "link_quality": round(link, 1),
+            "quality_pct": round(quality_pct, 1),
+            "signal_dbm": round(level, 1),
+            "noise_dbm": round(noise, 1),
+            "discard_nwid": parse_int(fields[4]),
+            "discard_crypt": parse_int(fields[5]),
+            "discard_frag": parse_int(fields[6]),
+            "discard_retry": parse_int(fields[7]),
+            "discard_misc": parse_int(fields[8]),
+            "missed_beacon": parse_int(fields[9]),
+        }
+    return stats
+
+
+def parse_iw_link_output(text: str) -> dict[str, object]:
+    state: dict[str, object] = {"connected": False}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("Connected to "):
+            state["connected"] = True
+            match = re.match(r"Connected to ([0-9a-f:]{17})", line, re.IGNORECASE)
+            if match:
+                state["bssid"] = match.group(1).lower()
+        elif line == "Not connected.":
+            state["connected"] = False
+        elif line.startswith("SSID:"):
+            state["ssid"] = line.split(":", 1)[1].strip()
+        elif line.startswith("freq:"):
+            frequency = parse_int(line)
+            if frequency > 0:
+                state["frequency_mhz"] = frequency
+                state["band"] = wireless_band_label(frequency)
+        elif line.startswith("signal:"):
+            value = parse_float(line)
+            if value is not None:
+                state["signal_dbm"] = value
+        elif line.startswith("rx bitrate:"):
+            bitrate = parse_iw_rate_mbps(line)
+            if bitrate is not None:
+                state["rx_bitrate_mbps"] = bitrate
+        elif line.startswith("tx bitrate:"):
+            bitrate = parse_iw_rate_mbps(line)
+            if bitrate is not None:
+                state["tx_bitrate_mbps"] = bitrate
+        elif line.startswith("RX:"):
+            match = re.search(r"RX:\s*(\d+)\s+bytes\s+\((\d+)\s+packets\)", line)
+            if match:
+                state["rx_bytes"] = int(match.group(1))
+                state["rx_packets"] = int(match.group(2))
+        elif line.startswith("TX:"):
+            match = re.search(r"TX:\s*(\d+)\s+bytes\s+\((\d+)\s+packets\)", line)
+            if match:
+                state["tx_bytes"] = int(match.group(1))
+                state["tx_packets"] = int(match.group(2))
+    return state
+
+
+def parse_iw_station_dump(text: str) -> dict[str, object]:
+    state: dict[str, object] = {}
+    in_station = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("Station "):
+            if in_station:
+                break
+            in_station = True
+            continue
+        if not in_station or ":" not in line:
+            continue
+        key, value = [part.strip() for part in line.split(":", 1)]
+        lower = key.lower()
+        if lower == "inactive time":
+            number = parse_float(value)
+            if number is not None:
+                state["inactive_ms"] = int(number)
+        elif lower == "connected time":
+            number = parse_float(value)
+            if number is not None:
+                state["connected_seconds"] = int(number)
+        elif lower == "signal avg":
+            number = parse_float(value)
+            if number is not None:
+                state["signal_avg_dbm"] = number
+        elif lower == "tx retries":
+            number = parse_float(value)
+            if number is not None:
+                state["tx_retries"] = int(number)
+        elif lower == "tx failed":
+            number = parse_float(value)
+            if number is not None:
+                state["tx_failed"] = int(number)
+        elif lower == "beacon loss":
+            number = parse_float(value)
+            if number is not None:
+                state["beacon_loss"] = int(number)
+        elif lower == "expected throughput":
+            bitrate = parse_iw_rate_mbps(value)
+            if bitrate is not None:
+                state["expected_throughput_mbps"] = bitrate
+        elif lower == "authorized":
+            state["authorized"] = value.lower() == "yes"
+        elif lower == "authenticated":
+            state["authenticated"] = value.lower() == "yes"
+        elif lower == "associated":
+            state["associated"] = value.lower() == "yes"
+        elif lower == "wmm/wme":
+            state["wmm"] = value.lower() == "yes"
+        elif lower == "mfp":
+            state["mfp"] = value.lower() == "yes"
+    return state
+
+
+def parse_rfkill_output(text: str) -> list[dict[str, object]]:
+    radios: list[dict[str, object]] = []
+    current: dict[str, object] | None = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        header = re.match(r"^\d+:\s+([^:]+):\s+(.+)$", line.strip())
+        if header:
+            if current and str(current.get("type", "")).lower() in {"wireless lan", "wlan", "wifi"}:
+                radios.append(current)
+            current = {
+                "name": header.group(1).strip(),
+                "type": header.group(2).strip(),
+            }
+            continue
+        if current is None or ":" not in line:
+            continue
+        key, value = [part.strip() for part in line.split(":", 1)]
+        lower = key.lower()
+        if lower == "soft blocked":
+            current["soft_blocked"] = value.lower() == "yes"
+        elif lower == "hard blocked":
+            current["hard_blocked"] = value.lower() == "yes"
+    if current and str(current.get("type", "")).lower() in {"wireless lan", "wlan", "wifi"}:
+        radios.append(current)
+    return radios
 
 
 def detect_ro_mounts() -> list[str]:
@@ -645,6 +856,7 @@ class MonitorBackend:
                 max_temp = max(max_temp, float(match.group(1)))
 
         snapshot_health = self._privileged_snapshot_health()
+        wifi_digest = self._wifi_digest()
 
         capture_cards = self.cached("capture_cards", 30.0, self._capture_cards)
         avmatrix_cards = [card for card in capture_cards if "avmatrix" in card.lower()]
@@ -702,6 +914,7 @@ class MonitorBackend:
                 "expected_version": int(snapshot_health.get("expected_version", PRIVILEGED_SNAPSHOT_VERSION)),
                 "age": snapshot_health.get("age"),
             },
+            "wifi": wifi_digest,
             "capture": {
                 "avmatrix_cards": len(avmatrix_cards),
                 "kernel_channels": len(avmatrix_sysfs_nodes),
@@ -801,6 +1014,34 @@ class MonitorBackend:
                 and current_version != previous_version
             ):
                 changes.append(f"Privileged snapshot schema: v{previous_version} -> v{current_version}")
+
+        current_wifi = current.get("wifi", {})
+        previous_wifi = previous.get("wifi", {})
+        if isinstance(current_wifi, dict) and isinstance(previous_wifi, dict):
+            current_connected = bool(current_wifi.get("connected"))
+            previous_connected = bool(previous_wifi.get("connected"))
+            if current_connected != previous_connected:
+                if current_connected:
+                    ssid = str(current_wifi.get("ssid", "")).strip()
+                    changes.append(f"Wi-Fi: connected to {ssid or 'network'}")
+                else:
+                    changes.append("Wi-Fi: link dropped")
+            current_ssid = str(current_wifi.get("ssid", "")).strip()
+            previous_ssid = str(previous_wifi.get("ssid", "")).strip()
+            if current_connected and previous_connected and current_ssid and previous_ssid and current_ssid != previous_ssid:
+                changes.append(f"Wi-Fi SSID: {previous_ssid} -> {current_ssid}")
+            current_signal = current_wifi.get("signal_dbm")
+            previous_signal = previous_wifi.get("signal_dbm")
+            if (
+                isinstance(current_signal, (int, float))
+                and isinstance(previous_signal, (int, float))
+                and abs(float(current_signal) - float(previous_signal)) >= 10.0
+            ):
+                changes.append(f"Wi-Fi signal: {previous_signal:.0f} -> {current_signal:.0f} dBm")
+            current_blocked = bool(current_wifi.get("blocked"))
+            previous_blocked = bool(previous_wifi.get("blocked"))
+            if current_blocked != previous_blocked:
+                changes.append("Wi-Fi radio: blocked" if current_blocked else "Wi-Fi radio: unblocked")
 
         current_capture = current.get("capture", {})
         previous_capture = previous.get("capture", {})
@@ -921,6 +1162,23 @@ class MonitorBackend:
                 problems.append((90, "! Privileged snapshot is unreadable"))
             elif status == "stale" and isinstance(age, int):
                 problems.append((65, f"? Privileged snapshot is stale ({self._age_label(age)} old)"))
+
+        wifi = current.get("wifi", {})
+        if isinstance(wifi, dict):
+            blocked = bool(wifi.get("blocked"))
+            connected = bool(wifi.get("connected"))
+            signal = wifi.get("signal_dbm")
+            ssid = str(wifi.get("ssid", "")).strip()
+            beacon_loss = wifi.get("beacon_loss")
+            if blocked:
+                problems.append((85, "! Wi-Fi radio is rfkill-blocked"))
+            elif connected and isinstance(signal, (int, float)):
+                if signal <= -78:
+                    problems.append((80, f"! Wi-Fi signal is very weak ({signal:.0f} dBm on {ssid or 'current network'})"))
+                elif signal <= -70:
+                    problems.append((55, f"? Wi-Fi signal is marginal ({signal:.0f} dBm on {ssid or 'current network'})"))
+            if connected and isinstance(beacon_loss, int) and beacon_loss > 0:
+                problems.append((70, f"? Wi-Fi reports beacon loss ({beacon_loss})"))
 
         capture = current.get("capture", {})
         if isinstance(capture, dict):
@@ -2887,6 +3145,388 @@ class MonitorBackend:
         listening_count = None if listening.stderr and not listening.stdout else len(line_list(listening.stdout))
         return established_count, listening_count
 
+    def _wireless_interfaces(self) -> list[str]:
+        root = Path("/sys/class/net")
+        if not root.exists():
+            return []
+        names = []
+        for path in sorted(root.iterdir()):
+            if (path / "wireless").exists() or (path / "phy80211").exists():
+                names.append(path.name)
+        return names
+
+    def _proc_net_wireless(self) -> dict[str, dict[str, object]]:
+        return parse_proc_net_wireless_text(read_text(Path("/proc/net/wireless")))
+
+    def _wireless_logs(self) -> list[str]:
+        result = run_command(
+            [
+                "journalctl",
+                "-b",
+                f"--grep={WIFI_LOG_PATTERN}",
+                "-n",
+                "10",
+                "--no-pager",
+                "-o",
+                "short-iso",
+            ],
+            timeout=5.0,
+        )
+        return parse_journal_lines(result, limit=6)
+
+    def _live_wifi_state(self) -> dict[str, object]:
+        quality = self.cached("proc_net_wireless", 5.0, self._proc_net_wireless)
+        interfaces: list[dict[str, object]] = []
+        for name in self._wireless_interfaces():
+            sysfs = Path("/sys/class/net") / name
+            entry: dict[str, object] = {
+                "interface": name,
+                "operstate": read_text(sysfs / "operstate").strip() or "unknown",
+                "mac": read_text(sysfs / "address").strip() or "",
+                "carrier": read_text(sysfs / "carrier").strip() == "1",
+                "mtu": parse_int(read_text(sysfs / "mtu"), default=0),
+            }
+            try:
+                entry["driver"] = (sysfs / "device" / "driver").resolve().name
+            except OSError:
+                pass
+
+            info_result = run_command(["iw", "dev", name, "info"], timeout=3.0)
+            if info_result.stdout:
+                for raw in info_result.stdout.splitlines():
+                    line = raw.strip()
+                    if line.startswith("type "):
+                        entry["type"] = line.split(None, 1)[1].strip()
+                    elif line.startswith("channel "):
+                        entry.update(parse_iw_channel_details(line))
+                    elif line.startswith("txpower "):
+                        number = parse_float(line)
+                        if number is not None:
+                            entry["tx_power_dbm"] = number
+
+            link_result = run_command(["iw", "dev", name, "link"], timeout=3.0)
+            if link_result.stdout:
+                entry.update(parse_iw_link_output(link_result.stdout))
+
+            station_result = run_command(["iw", "dev", name, "station", "dump"], timeout=4.0)
+            if station_result.stdout:
+                entry.update(parse_iw_station_dump(station_result.stdout))
+
+            power_save_result = run_command(["iw", "dev", name, "get", "power_save"], timeout=3.0)
+            if power_save_result.stdout:
+                for raw in power_save_result.stdout.splitlines():
+                    line = raw.strip()
+                    if line.lower().startswith("power save:"):
+                        entry["power_save"] = line.split(":", 1)[1].strip().lower()
+                        break
+
+            if isinstance(quality, dict) and name in quality:
+                entry.update(quality[name])
+            interfaces.append(entry)
+
+        rfkill_result = run_command(["rfkill", "list"], timeout=3.0)
+        radios = parse_rfkill_output(rfkill_result.stdout) if rfkill_result.stdout else []
+        logs = self.cached("wifi_logs", 60.0, self._wireless_logs)
+        return {
+            "interfaces": interfaces,
+            "rfkill": radios,
+            "logs": logs,
+        }
+
+    def _wifi_state(self) -> dict[str, object]:
+        privileged = self._privileged_section("wifi")
+        if privileged:
+            return privileged
+        live = self.cached("wifi_live_state", 10.0, self._live_wifi_state)
+        if isinstance(live, dict):
+            return live
+        return {}
+
+    @staticmethod
+    def _wifi_interface_sort_key(entry: dict[str, object]) -> tuple[int, int, str]:
+        connected = 0 if entry.get("connected") else 1
+        carrier = 0 if entry.get("carrier") else 1
+        return (connected, carrier, str(entry.get("interface", "")))
+
+    @staticmethod
+    def _wifi_signal_label(signal_dbm: float | int | None) -> str:
+        if not isinstance(signal_dbm, (int, float)):
+            return "unknown signal"
+        if signal_dbm >= -60:
+            return "excellent signal"
+        if signal_dbm >= -67:
+            return "good signal"
+        if signal_dbm >= -75:
+            return "fair signal"
+        return "weak signal"
+
+    @staticmethod
+    def _wifi_issue_logs(entries: Sequence[str]) -> list[str]:
+        issue_keywords = (
+            "error",
+            "fail",
+            "failed",
+            "warn",
+            "timeout",
+            "disconnect",
+            "roam",
+            "deauth",
+            "auth",
+            "blocked",
+        )
+        issues = [entry for entry in entries if any(token in entry.lower() for token in issue_keywords)]
+        return issues[:3]
+
+    def _wifi_summary_line(self, entry: dict[str, object]) -> str:
+        iface = str(entry.get("interface", "wifi"))
+        driver = str(entry.get("driver", "")).strip()
+        operstate = str(entry.get("operstate", "unknown"))
+        carrier = "carrier" if entry.get("carrier") else "no-carrier"
+        mode = str(entry.get("type", "")).strip()
+        parts = [f"{iface} {operstate}", carrier]
+        if driver:
+            parts.append(driver)
+        if mode:
+            parts.append(mode)
+        return " | ".join(parts)
+
+    def _wifi_link_line(self, entry: dict[str, object]) -> str:
+        if not entry.get("connected"):
+            return "Link: not associated"
+        ssid = str(entry.get("ssid", "")).strip() or "hidden SSID"
+        bssid = str(entry.get("bssid", "")).strip()
+        band = str(entry.get("band", "")).strip()
+        channel = entry.get("channel")
+        frequency = entry.get("frequency_mhz")
+        width = entry.get("width_mhz")
+        parts = [ssid]
+        if bssid:
+            parts.append(bssid)
+        if band:
+            parts.append(band)
+        if isinstance(channel, int) and channel > 0:
+            parts.append(f"ch {channel}")
+        if isinstance(width, int) and width > 0:
+            parts.append(f"{width} MHz")
+        elif isinstance(frequency, int) and frequency > 0:
+            parts.append(f"{frequency} MHz")
+        return "Link: " + " | ".join(parts)
+
+    def _wifi_signal_line(self, entry: dict[str, object]) -> str:
+        signal = entry.get("signal_dbm")
+        noise = entry.get("noise_dbm")
+        quality = entry.get("quality_pct")
+        tx_power = entry.get("tx_power_dbm")
+        parts = []
+        if isinstance(signal, (int, float)):
+            parts.append(f"{signal:.0f} dBm")
+            parts.append(self._wifi_signal_label(signal))
+        if isinstance(quality, (int, float)):
+            parts.append(f"{quality:.0f}% quality")
+        if isinstance(noise, (int, float)):
+            parts.append(f"noise {noise:.0f} dBm")
+        if isinstance(tx_power, (int, float)):
+            parts.append(f"txpower {tx_power:.1f} dBm")
+        return "Signal: " + (" | ".join(parts) if parts else "unavailable")
+
+    @staticmethod
+    def _wifi_phy_line(entry: dict[str, object]) -> str:
+        rx = entry.get("rx_bitrate_mbps")
+        tx = entry.get("tx_bitrate_mbps")
+        expected = entry.get("expected_throughput_mbps")
+        power_save = str(entry.get("power_save", "")).strip()
+        parts = []
+        if isinstance(rx, (int, float)):
+            parts.append(f"rx {rx:.1f} Mb/s")
+        if isinstance(tx, (int, float)):
+            parts.append(f"tx {tx:.1f} Mb/s")
+        if isinstance(expected, (int, float)):
+            parts.append(f"expected {expected:.1f} Mb/s")
+        if power_save:
+            parts.append(f"power save {power_save}")
+        return "PHY: " + (" | ".join(parts) if parts else "unavailable")
+
+    @staticmethod
+    def _wifi_traffic_line(entry: dict[str, object]) -> str:
+        rx_bytes = entry.get("rx_bytes")
+        tx_bytes = entry.get("tx_bytes")
+        rx_packets = entry.get("rx_packets")
+        tx_packets = entry.get("tx_packets")
+        connected_seconds = entry.get("connected_seconds")
+        parts = []
+        if isinstance(rx_bytes, int) and rx_bytes >= 0:
+            rx_label = format_bytes(rx_bytes)
+            if isinstance(rx_packets, int):
+                rx_label += f" / {rx_packets} pkts"
+            parts.append(f"rx {rx_label}")
+        if isinstance(tx_bytes, int) and tx_bytes >= 0:
+            tx_label = format_bytes(tx_bytes)
+            if isinstance(tx_packets, int):
+                tx_label += f" / {tx_packets} pkts"
+            parts.append(f"tx {tx_label}")
+        if isinstance(connected_seconds, int) and connected_seconds >= 0:
+            parts.append(f"connected {format_duration_compact(connected_seconds)}")
+        return "Traffic: " + (" | ".join(parts) if parts else "unavailable")
+
+    @staticmethod
+    def _wifi_reliability_line(entry: dict[str, object]) -> str:
+        inactive_ms = entry.get("inactive_ms")
+        retries = entry.get("tx_retries")
+        failed = entry.get("tx_failed")
+        beacon_loss = entry.get("beacon_loss")
+        discard_retry = entry.get("discard_retry")
+        missed_beacon = entry.get("missed_beacon")
+        authorized = entry.get("authorized")
+        authenticated = entry.get("authenticated")
+        associated = entry.get("associated")
+        parts = []
+        if isinstance(inactive_ms, int):
+            parts.append(f"idle {inactive_ms} ms")
+        if isinstance(retries, int):
+            parts.append(f"retries {retries}")
+        if isinstance(failed, int):
+            parts.append(f"failed {failed}")
+        if isinstance(beacon_loss, int):
+            parts.append(f"beacon loss {beacon_loss}")
+        if isinstance(discard_retry, int) and discard_retry > 0:
+            parts.append(f"driver retry discards {discard_retry}")
+        if isinstance(missed_beacon, int) and missed_beacon > 0:
+            parts.append(f"missed beacon {missed_beacon}")
+        auth_states = []
+        if isinstance(authorized, bool):
+            auth_states.append("authorized" if authorized else "not authorized")
+        if isinstance(authenticated, bool):
+            auth_states.append("authenticated" if authenticated else "not authenticated")
+        if isinstance(associated, bool):
+            auth_states.append("associated" if associated else "not associated")
+        if auth_states:
+            parts.append(", ".join(auth_states))
+        return "Reliability: " + (" | ".join(parts) if parts else "no station metrics")
+
+    def _wifi_assessment_line(self, entry: dict[str, object]) -> str:
+        if not entry.get("connected"):
+            operstate = str(entry.get("operstate", "unknown"))
+            return f"Assessment: disconnected | operstate {operstate}"
+        signal = entry.get("signal_dbm")
+        band = str(entry.get("band", "")).strip()
+        expected = entry.get("expected_throughput_mbps")
+        power_save = str(entry.get("power_save", "")).strip()
+        retries = entry.get("tx_retries")
+        failed = entry.get("tx_failed")
+        beacon_loss = entry.get("beacon_loss")
+        parts = []
+        parts.append(self._wifi_signal_label(signal if isinstance(signal, (int, float)) else None))
+        if band:
+            parts.append(f"{band} link")
+        if isinstance(expected, (int, float)):
+            if expected >= 400:
+                parts.append("high expected throughput")
+            elif expected >= 100:
+                parts.append("moderate expected throughput")
+            else:
+                parts.append("low expected throughput")
+        if isinstance(beacon_loss, int) and beacon_loss > 0:
+            parts.append("beacon loss observed")
+        elif isinstance(failed, int) and failed > 0:
+            parts.append("tx failures observed")
+        elif isinstance(retries, int) and retries > 200:
+            parts.append("retry-heavy link")
+        else:
+            parts.append("no obvious retry pressure")
+        if power_save == "on":
+            parts.append("power save enabled")
+        return "Assessment: " + " | ".join(parts)
+
+    def _wifi_digest(self) -> dict[str, object]:
+        state = self._wifi_state()
+        interfaces = state.get("interfaces", [])
+        radios = state.get("rfkill", [])
+        digest: dict[str, object] = {
+            "present": False,
+            "blocked": False,
+            "connected": False,
+        }
+        if isinstance(radios, list):
+            for radio in radios:
+                if not isinstance(radio, dict):
+                    continue
+                if radio.get("soft_blocked") or radio.get("hard_blocked"):
+                    digest["blocked"] = True
+                    break
+        if not isinstance(interfaces, list) or not interfaces:
+            return digest
+        parsed_interfaces = [entry for entry in interfaces if isinstance(entry, dict)]
+        if not parsed_interfaces:
+            return digest
+        parsed_interfaces.sort(key=self._wifi_interface_sort_key)
+        active = parsed_interfaces[0]
+        digest["present"] = True
+        digest["interface"] = str(active.get("interface", ""))
+        digest["connected"] = bool(active.get("connected"))
+        if active.get("connected"):
+            digest["ssid"] = str(active.get("ssid", ""))
+        signal = active.get("signal_dbm")
+        if isinstance(signal, (int, float)):
+            digest["signal_dbm"] = float(signal)
+        retries = active.get("tx_retries")
+        failed = active.get("tx_failed")
+        beacon_loss = active.get("beacon_loss")
+        if isinstance(retries, int):
+            digest["tx_retries"] = retries
+        if isinstance(failed, int):
+            digest["tx_failed"] = failed
+        if isinstance(beacon_loss, int):
+            digest["beacon_loss"] = beacon_loss
+        return digest
+
+    def collect_wifi(self) -> list[str]:
+        state = self._wifi_state()
+        snapshot_line = self._privileged_snapshot_line() if self._privileged_section("wifi") else None
+        interfaces = state.get("interfaces", [])
+        radios = state.get("rfkill", [])
+        logs = state.get("logs", [])
+
+        lines: list[str] = []
+        if snapshot_line:
+            lines.append(snapshot_line)
+
+        if isinstance(radios, list) and radios:
+            radio_parts = []
+            for radio in radios[:4]:
+                if not isinstance(radio, dict):
+                    continue
+                name = str(radio.get("name", "wifi"))
+                status = "hard-blocked" if radio.get("hard_blocked") else "soft-blocked" if radio.get("soft_blocked") else "unblocked"
+                radio_parts.append(f"{name} {status}")
+            if radio_parts:
+                lines.append("RFKill: " + " | ".join(radio_parts))
+
+        parsed_interfaces = [entry for entry in interfaces if isinstance(entry, dict)] if isinstance(interfaces, list) else []
+        if not parsed_interfaces:
+            lines.append("No wireless interfaces detected.")
+            return lines
+
+        parsed_interfaces.sort(key=self._wifi_interface_sort_key)
+        for entry in parsed_interfaces[:2]:
+            lines.append(self._wifi_summary_line(entry))
+            lines.append("  " + self._wifi_link_line(entry))
+            lines.append("  " + self._wifi_signal_line(entry))
+            lines.append("  " + self._wifi_phy_line(entry))
+            lines.append("  " + self._wifi_traffic_line(entry))
+            lines.append("  " + self._wifi_reliability_line(entry))
+            lines.append("  " + self._wifi_assessment_line(entry))
+
+        lines.append("Recent Wi-Fi logs:")
+        issues = self._wifi_issue_logs(logs) if isinstance(logs, list) else []
+        if issues:
+            for item in issues[:3]:
+                lines.append(f"  {item}")
+        elif isinstance(logs, list) and logs:
+            lines.append("  No obvious Wi-Fi warnings in current boot journal.")
+        else:
+            lines.append("  No Wi-Fi journal entries found this boot.")
+        return lines
+
     def collect_network(self) -> list[str]:
         privileged = self._privileged_section("network")
         if privileged:
@@ -3153,6 +3793,7 @@ class DashboardModel:
             Collector("fs_integrity", "tier2", "Filesystem Integrity", 30, backend.collect_fs_integrity),
             Collector("device_specific", "tier2", "Device-Specific Signals", 20, backend.collect_device_specific),
             Collector("network", "tier3", "Network State", 15, backend.collect_network),
+            Collector("wifi", "tier3", "Wi-Fi Intelligence", 15, backend.collect_wifi),
             Collector("security", "tier3", "Security / Exposure Surface", 30, backend.collect_security),
             Collector("hygiene", "tier3", "System Hygiene", 300, backend.collect_hygiene),
             Collector("boot", "tier3", "Boot / Regression Signals", 300, backend.collect_boot),

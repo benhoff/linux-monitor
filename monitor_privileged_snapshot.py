@@ -15,7 +15,7 @@ from typing import Sequence
 
 
 DEFAULT_OUTPUT = Path("/run/monitor/privileged_snapshot.json")
-SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 PSEUDO_FILESYSTEMS = {
     "autofs",
     "binfmt_misc",
@@ -46,6 +46,7 @@ FS_LOG_PATTERN = (
     r"EXT4-fs error|BTRFS|XFS|Buffer I/O error|I/O error|"
     r"read-only file system|Remounting filesystem read-only|mount failure|corrupt"
 )
+WIFI_LOG_PATTERN = r"wlan|wifi|wireless|wpa_supplicant|NetworkManager|cfg80211|mac80211"
 
 
 def run_command(args: Sequence[str], timeout: float = 6.0) -> subprocess.CompletedProcess[str] | None:
@@ -80,6 +81,16 @@ def parse_int(value: str, default: int = 0) -> int:
     if not match:
         return default
     return int(match.group(0))
+
+
+def parse_float(value: str) -> float | None:
+    match = re.search(r"-?\d+(?:\.\d+)?", value)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
 
 
 def command_lines(args: Sequence[str], timeout: float = 6.0, limit: int | None = None) -> list[str]:
@@ -259,6 +270,286 @@ def visible_mounts() -> list[str]:
     return mounts
 
 
+def wireless_interfaces() -> list[str]:
+    root = Path("/sys/class/net")
+    interfaces = []
+    if not root.exists():
+        return interfaces
+    for path in sorted(root.iterdir()):
+        if (path / "wireless").exists() or (path / "phy80211").exists():
+            interfaces.append(path.name)
+    return interfaces
+
+
+def wireless_band_label(frequency_mhz: int | None) -> str | None:
+    if frequency_mhz is None:
+        return None
+    if frequency_mhz >= 5925:
+        return "6 GHz"
+    if frequency_mhz >= 4900:
+        return "5 GHz"
+    if frequency_mhz >= 2400:
+        return "2.4 GHz"
+    return f"{frequency_mhz} MHz"
+
+
+def parse_iw_channel_details(raw: str) -> dict[str, object]:
+    details: dict[str, object] = {}
+    channel_match = re.search(r"\bchannel\s+(\d+)\b", raw)
+    freq_match = re.search(r"\((\d+)\s*MHz\)", raw)
+    width_match = re.search(r"width:\s*([0-9]+)\s*MHz", raw)
+    center1_match = re.search(r"center1:\s*(\d+)", raw)
+    if channel_match:
+        details["channel"] = int(channel_match.group(1))
+    if freq_match:
+        frequency = int(freq_match.group(1))
+        details["frequency_mhz"] = frequency
+        details["band"] = wireless_band_label(frequency)
+    if width_match:
+        details["width_mhz"] = int(width_match.group(1))
+    if center1_match:
+        details["center1_mhz"] = int(center1_match.group(1))
+    return details
+
+
+def parse_iw_rate_mbps(raw: str) -> float | None:
+    match = re.search(r"([0-9]+(?:\.\d+)?)\s*MBit/s", raw)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def parse_proc_net_wireless() -> dict[str, dict[str, object]]:
+    stats: dict[str, dict[str, object]] = {}
+    lines = read_text(Path("/proc/net/wireless")).splitlines()
+    for raw in lines[2:]:
+        if ":" not in raw:
+            continue
+        iface, rest = raw.split(":", 1)
+        fields = rest.split()
+        if len(fields) < 10:
+            continue
+        link = parse_float(fields[1])
+        level = parse_float(fields[2])
+        noise = parse_float(fields[3])
+        if link is None or level is None or noise is None:
+            continue
+        quality_pct = max(0.0, min(link / 70.0 * 100.0, 100.0))
+        stats[iface.strip()] = {
+            "link_quality": round(link, 1),
+            "quality_pct": round(quality_pct, 1),
+            "signal_dbm": round(level, 1),
+            "noise_dbm": round(noise, 1),
+            "discard_nwid": parse_int(fields[4]),
+            "discard_crypt": parse_int(fields[5]),
+            "discard_frag": parse_int(fields[6]),
+            "discard_retry": parse_int(fields[7]),
+            "discard_misc": parse_int(fields[8]),
+            "missed_beacon": parse_int(fields[9]),
+        }
+    return stats
+
+
+def parse_iw_link_output(text: str) -> dict[str, object]:
+    state: dict[str, object] = {"connected": False}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("Connected to "):
+            state["connected"] = True
+            match = re.match(r"Connected to ([0-9a-f:]{17})", line, re.IGNORECASE)
+            if match:
+                state["bssid"] = match.group(1).lower()
+        elif line == "Not connected.":
+            state["connected"] = False
+        elif line.startswith("SSID:"):
+            state["ssid"] = line.split(":", 1)[1].strip()
+        elif line.startswith("freq:"):
+            frequency = parse_int(line)
+            if frequency > 0:
+                state["frequency_mhz"] = frequency
+                state["band"] = wireless_band_label(frequency)
+        elif line.startswith("signal:"):
+            value = parse_float(line)
+            if value is not None:
+                state["signal_dbm"] = value
+        elif line.startswith("rx bitrate:"):
+            bitrate = parse_iw_rate_mbps(line)
+            if bitrate is not None:
+                state["rx_bitrate_mbps"] = bitrate
+        elif line.startswith("tx bitrate:"):
+            bitrate = parse_iw_rate_mbps(line)
+            if bitrate is not None:
+                state["tx_bitrate_mbps"] = bitrate
+        elif line.startswith("RX:"):
+            match = re.search(r"RX:\s*(\d+)\s+bytes\s+\((\d+)\s+packets\)", line)
+            if match:
+                state["rx_bytes"] = int(match.group(1))
+                state["rx_packets"] = int(match.group(2))
+        elif line.startswith("TX:"):
+            match = re.search(r"TX:\s*(\d+)\s+bytes\s+\((\d+)\s+packets\)", line)
+            if match:
+                state["tx_bytes"] = int(match.group(1))
+                state["tx_packets"] = int(match.group(2))
+    return state
+
+
+def parse_iw_station_dump(text: str) -> dict[str, object]:
+    state: dict[str, object] = {}
+    in_station = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("Station "):
+            if in_station:
+                break
+            in_station = True
+            continue
+        if not in_station or ":" not in line:
+            continue
+        key, value = [part.strip() for part in line.split(":", 1)]
+        lower = key.lower()
+        if lower == "inactive time":
+            number = parse_float(value)
+            if number is not None:
+                state["inactive_ms"] = int(number)
+        elif lower == "connected time":
+            number = parse_float(value)
+            if number is not None:
+                state["connected_seconds"] = int(number)
+        elif lower == "signal avg":
+            number = parse_float(value)
+            if number is not None:
+                state["signal_avg_dbm"] = number
+        elif lower == "tx retries":
+            number = parse_float(value)
+            if number is not None:
+                state["tx_retries"] = int(number)
+        elif lower == "tx failed":
+            number = parse_float(value)
+            if number is not None:
+                state["tx_failed"] = int(number)
+        elif lower == "beacon loss":
+            number = parse_float(value)
+            if number is not None:
+                state["beacon_loss"] = int(number)
+        elif lower == "expected throughput":
+            bitrate = parse_iw_rate_mbps(value)
+            if bitrate is not None:
+                state["expected_throughput_mbps"] = bitrate
+        elif lower == "authorized":
+            state["authorized"] = value.lower() == "yes"
+        elif lower == "authenticated":
+            state["authenticated"] = value.lower() == "yes"
+        elif lower == "associated":
+            state["associated"] = value.lower() == "yes"
+        elif lower == "wmm/wme":
+            state["wmm"] = value.lower() == "yes"
+        elif lower == "mfp":
+            state["mfp"] = value.lower() == "yes"
+    return state
+
+
+def parse_rfkill_output(text: str) -> list[dict[str, object]]:
+    radios: list[dict[str, object]] = []
+    current: dict[str, object] | None = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        header = re.match(r"^\d+:\s+([^:]+):\s+(.+)$", line.strip())
+        if header:
+            if current and str(current.get("type", "")).lower() in {"wireless lan", "wlan", "wifi"}:
+                radios.append(current)
+            current = {
+                "name": header.group(1).strip(),
+                "type": header.group(2).strip(),
+            }
+            continue
+        if current is None or ":" not in line:
+            continue
+        key, value = [part.strip() for part in line.split(":", 1)]
+        lower = key.lower()
+        if lower == "soft blocked":
+            current["soft_blocked"] = value.lower() == "yes"
+        elif lower == "hard blocked":
+            current["hard_blocked"] = value.lower() == "yes"
+    if current and str(current.get("type", "")).lower() in {"wireless lan", "wlan", "wifi"}:
+        radios.append(current)
+    return radios
+
+
+def wifi_logs() -> list[str]:
+    return command_lines(
+        ["journalctl", "-b", f"--grep={WIFI_LOG_PATTERN}", "-n", "10", "--no-pager", "-o", "short-iso"],
+        timeout=5.0,
+        limit=6,
+    )
+
+
+def wifi_snapshot() -> dict[str, object]:
+    quality = parse_proc_net_wireless()
+    interfaces: list[dict[str, object]] = []
+    for name in wireless_interfaces():
+        sysfs = Path("/sys/class/net") / name
+        entry: dict[str, object] = {
+            "interface": name,
+            "operstate": read_text(sysfs / "operstate").strip() or "unknown",
+            "mac": read_text(sysfs / "address").strip() or "",
+            "carrier": read_text(sysfs / "carrier").strip() == "1",
+            "mtu": parse_int(read_text(sysfs / "mtu"), default=0),
+        }
+        try:
+            entry["driver"] = (sysfs / "device" / "driver").resolve().name
+        except OSError:
+            pass
+
+        info_result = run_command(["iw", "dev", name, "info"], timeout=3.0)
+        if info_result is not None and info_result.stdout:
+            for raw in info_result.stdout.splitlines():
+                line = raw.strip()
+                if line.startswith("type "):
+                    entry["type"] = line.split(None, 1)[1].strip()
+                elif line.startswith("channel "):
+                    entry.update(parse_iw_channel_details(line))
+                elif line.startswith("txpower "):
+                    number = parse_float(line)
+                    if number is not None:
+                        entry["tx_power_dbm"] = number
+
+        link_result = run_command(["iw", "dev", name, "link"], timeout=3.0)
+        if link_result is not None and link_result.stdout:
+            entry.update(parse_iw_link_output(link_result.stdout))
+
+        station_result = run_command(["iw", "dev", name, "station", "dump"], timeout=4.0)
+        if station_result is not None and station_result.stdout:
+            entry.update(parse_iw_station_dump(station_result.stdout))
+
+        power_save_result = run_command(["iw", "dev", name, "get", "power_save"], timeout=3.0)
+        if power_save_result is not None and power_save_result.stdout:
+            for raw in power_save_result.stdout.splitlines():
+                line = raw.strip()
+                if line.lower().startswith("power save:"):
+                    entry["power_save"] = line.split(":", 1)[1].strip().lower()
+                    break
+
+        if name in quality:
+            entry.update(quality[name])
+        interfaces.append(entry)
+
+    rfkill_result = run_command(["rfkill", "list"], timeout=3.0)
+    radios = parse_rfkill_output(rfkill_result.stdout) if rfkill_result is not None and rfkill_result.stdout else []
+
+    return {
+        "interfaces": interfaces,
+        "rfkill": radios,
+        "logs": wifi_logs(),
+    }
+
+
 def collect_snapshot() -> dict[str, object]:
     system_state = run_command(["systemctl", "is-system-running"], timeout=3.0)
     enabled_units = command_lines(
@@ -343,6 +634,7 @@ def collect_snapshot() -> dict[str, object]:
             "dns_check": dns_check,
             "connections": socket_counts(),
         },
+        "wifi": wifi_snapshot(),
         "security": {
             "listeners": listening_sockets(),
             "failed_logins": command_lines(

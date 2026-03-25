@@ -6,7 +6,7 @@ It groups the dashboard into three tabs:
 
 - `Tier 1`: kernel/firmware/NVIDIA package tracking, storage, systemd health, journal errors
 - `Tier 2`: memory pressure, CPU/load, thermal state, hardware health, filesystem integrity, device-specific signals
-- `Tier 3`: network state, exposure surface, hygiene, boot regressions
+- `Tier 3`: network state, Wi-Fi intelligence, exposure surface, hygiene, boot regressions
 - `Packages`: official repo update backlog with size totals, ETA, and per-package rows
 - `AUR`: AUR update backlog with size totals, ETA, and per-package rows
 
@@ -48,6 +48,7 @@ python3 monitor_tui.py --once --tab all
 - The package panel tracks only kernel, firmware, and NVIDIA versions.
 - In TUI mode, package update metadata is refreshed in the background and `r` also triggers a package refresh request.
 - Tier 1 includes a `Privileged Snapshot` panel that checks snapshot schema drift and staleness before the TUI trusts privileged data.
+- Tier 3 includes a `Wi-Fi Intelligence` panel that surfaces link quality, RF state, PHY rates, retries, beacon loss, and recent Wi-Fi journal hints when those signals are available.
 
 ## Privileged Snapshot
 
