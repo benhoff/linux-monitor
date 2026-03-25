@@ -1,0 +1,71 @@
+# monitor
+
+`monitor_tui.py` is a no-dependency Python TUI for Arch/Linux system health checks.
+
+It groups the dashboard into three tabs:
+
+- `Tier 1`: kernel/firmware/NVIDIA package tracking, storage, systemd health, journal errors
+- `Tier 2`: memory pressure, CPU/load, thermal state, hardware health, filesystem integrity, device-specific signals
+- `Tier 3`: network state, exposure surface, hygiene, boot regressions
+
+## Run
+
+```bash
+python3 monitor_tui.py
+```
+
+## Keys
+
+- `Left` / `Right`: switch tabs
+- `Up` / `Down`: scroll
+- `PageUp` / `PageDown`: faster scroll
+- `r`: force refresh
+- `q`: quit
+
+## Colors
+
+- Green: healthy / empty / zero-count states
+- Yellow: watch items, missing permissions, or degraded visibility
+- Red: likely problems or sections that need attention now
+
+## One-shot mode
+
+```bash
+python3 monitor_tui.py --once --tab tier1
+python3 monitor_tui.py --once --tab tier2
+python3 monitor_tui.py --once --tab all
+```
+
+## Notes
+
+- The app uses standard Linux interfaces first (`/proc`, `/sys`) and falls back to commands like `pacman`, `yay`, `journalctl`, `systemctl`, `smartctl`, `nvidia-smi`, `ip`, `ss`, and `ffmpeg` when available.
+- Some sections will show partial data if tools are missing or if the current user cannot read privileged system state.
+- The package panel tracks only kernel, firmware, and NVIDIA versions.
+- In TUI mode, package update metadata is refreshed in the background and `r` also triggers a package refresh request.
+
+## Privileged Snapshot
+
+The safe privilege model is:
+
+- run the TUI as your normal user
+- run `monitor_privileged_snapshot.py` as root on a timer
+- let the TUI read `/run/monitor/privileged_snapshot.json`
+
+Write a snapshot manually:
+
+```bash
+sudo python3 monitor_privileged_snapshot.py --output /run/monitor/privileged_snapshot.json
+```
+
+Use a different snapshot path:
+
+```bash
+MONITOR_PRIVILEGED_SNAPSHOT=/path/to/privileged_snapshot.json python3 monitor_tui.py
+```
+
+Example systemd unit templates are in:
+
+- `contrib/systemd/monitor-privileged-snapshot.service`
+- `contrib/systemd/monitor-privileged-snapshot.timer`
+
+Edit `ExecStart` in the service file to point at your real repo path before installing it.

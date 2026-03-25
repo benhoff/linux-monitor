@@ -1,0 +1,12 @@
+[Unit]
+Description=Write privileged monitor snapshot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Update ExecStart to the real location of monitor_privileged_snapshot.py on your system.
+ExecStart=/usr/bin/python3 /opt/monitor/monitor_privileged_snapshot.py --output /run/monitor/privileged_snapshot.json
+
+[Install]
+WantedBy=multi-user.target
