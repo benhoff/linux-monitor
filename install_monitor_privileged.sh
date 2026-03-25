@@ -5,13 +5,16 @@ set -euo pipefail
 SERVICE_NAME="monitor-privileged-snapshot.service"
 TIMER_NAME="monitor-privileged-snapshot.timer"
 INSTALL_DIR="/usr/local/lib/monitor"
+BIN_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
 SNAPSHOT_OUTPUT="/run/monitor/privileged_snapshot.json"
 REFRESH_INTERVAL="${MONITOR_SNAPSHOT_INTERVAL:-2min}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_SCRIPT="${SCRIPT_DIR}/monitor_privileged_snapshot.py"
+SOURCE_REFRESH="${SCRIPT_DIR}/refresh_monitor_privileged.sh"
 INSTALLED_SCRIPT="${INSTALL_DIR}/monitor_privileged_snapshot.py"
+INSTALLED_REFRESH="${BIN_DIR}/monitor-privileged-refresh"
 SERVICE_PATH="${SYSTEMD_DIR}/${SERVICE_NAME}"
 TIMER_PATH="${SYSTEMD_DIR}/${TIMER_NAME}"
 
@@ -76,6 +79,9 @@ main() {
 
   install -d -m 0755 "${INSTALL_DIR}"
   install -m 0755 "${SOURCE_SCRIPT}" "${INSTALLED_SCRIPT}"
+  if [[ -f "${SOURCE_REFRESH}" ]]; then
+    install -m 0755 "${SOURCE_REFRESH}" "${INSTALLED_REFRESH}"
+  fi
 
   write_service
   write_timer
@@ -85,6 +91,9 @@ main() {
   systemctl start "${SERVICE_NAME}"
 
   printf 'Installed %s\n' "${INSTALLED_SCRIPT}"
+  if [[ -f "${SOURCE_REFRESH}" ]]; then
+    printf 'Installed %s\n' "${INSTALLED_REFRESH}"
+  fi
   printf 'Installed %s\n' "${SERVICE_PATH}"
   printf 'Installed %s\n' "${TIMER_PATH}"
   printf 'Enabled and started %s\n' "${TIMER_NAME}"

@@ -7,6 +7,7 @@ It groups the dashboard into three tabs:
 - `Tier 1`: kernel/firmware/NVIDIA package tracking, storage, systemd health, journal errors
 - `Tier 2`: memory pressure, CPU/load, thermal state, hardware health, filesystem integrity, device-specific signals
 - `Tier 3`: network state, exposure surface, hygiene, boot regressions
+- `Packages`: full pending update backlog, split into official repo and AUR packages
 
 ## Run
 
@@ -33,6 +34,7 @@ python3 monitor_tui.py
 ```bash
 python3 monitor_tui.py --once --tab tier1
 python3 monitor_tui.py --once --tab tier2
+python3 monitor_tui.py --once --tab packages
 python3 monitor_tui.py --once --tab all
 ```
 
@@ -42,6 +44,7 @@ python3 monitor_tui.py --once --tab all
 - Some sections will show partial data if tools are missing or if the current user cannot read privileged system state.
 - The package panel tracks only kernel, firmware, and NVIDIA versions.
 - In TUI mode, package update metadata is refreshed in the background and `r` also triggers a package refresh request.
+- Tier 1 includes a `Privileged Snapshot` panel that checks snapshot schema drift and staleness before the TUI trusts privileged data.
 
 ## Privileged Snapshot
 
@@ -63,6 +66,18 @@ Install the privileged snapshot service and timer:
 ./install_monitor_privileged.sh
 ```
 
+Refresh the installed privileged snapshot writer and force a new snapshot:
+
+```bash
+./refresh_monitor_privileged.sh
+```
+
+If you installed the helper into `/usr/local/bin`, you can also run:
+
+```bash
+monitor-privileged-refresh
+```
+
 Use a different snapshot path:
 
 ```bash
@@ -75,3 +90,4 @@ Example systemd unit templates are in:
 - `contrib/systemd/monitor-privileged-snapshot.timer`
 
 The installer writes concrete unit files into `/etc/systemd/system` and prompts for `sudo` automatically.
+It also installs `monitor-privileged-refresh` into `/usr/local/bin` when `refresh_monitor_privileged.sh` is present in the repo.

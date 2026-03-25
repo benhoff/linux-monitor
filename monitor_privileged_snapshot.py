@@ -15,6 +15,7 @@ from typing import Sequence
 
 
 DEFAULT_OUTPUT = Path("/run/monitor/privileged_snapshot.json")
+SNAPSHOT_VERSION = 2
 PSEUDO_FILESYSTEMS = {
     "autofs",
     "binfmt_misc",
@@ -278,6 +279,8 @@ def collect_snapshot() -> dict[str, object]:
     )
 
     snapshot = {
+        "snapshot_version": SNAPSHOT_VERSION,
+        "snapshot_writer": os.path.abspath(__file__),
         "generated_at": time.time(),
         "systemd": {
             "state": line_list(system_state.stdout)[0] if system_state and system_state.stdout else "unknown",
