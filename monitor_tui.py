@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import curses
+import hashlib
 import json
 import os
 import re
@@ -27,11 +28,14 @@ TAB_TITLES = {
     "packages": "Packages",
 }
 PACKAGE_REFRESH_INTERVAL = 900
+PACKAGE_METADATA_INTERVAL = 600
 DIFF_SNAPSHOT_INTERVAL = 120
 DEFAULT_PRIVILEGED_SNAPSHOT = "/run/monitor/privileged_snapshot.json"
 PRIVILEGED_SNAPSHOT_VERSION = 2
 DEFAULT_PRIVILEGED_SNAPSHOT_MAX_AGE = 15 * 60
 PRIVILEGED_REFRESH_SCRIPT = "./refresh_monitor_privileged.sh"
+PACKAGE_EST_DOWNLOAD_BYTES_PER_SEC = 10 * 1024 * 1024
+PACKAGE_EST_AUR_SECONDS = 45
 PSEUDO_FILESYSTEMS = {
     "autofs",
     "binfmt_misc",
@@ -141,6 +145,16 @@ class PackageRefreshState:
     aur_error: str | None = None
 
 
+@dataclass(frozen=True)
+class PackageUpdateRow:
+    source: str
+    name: str
+    current: str
+    latest: str
+    download_size: int | None = None
+    installed_size: int | None = None
+
+
 def run_command(args: Sequence[str], timeout: float = 5.0) -> CommandResult:
     try:
         completed = subprocess.run(
@@ -200,6 +214,34 @@ def format_percent(numerator: float, denominator: float) -> str:
     return f"{(numerator / denominator) * 100:.1f}%"
 
 
+def parse_size_bytes(value: str) -> int | None:
+    text = value.strip()
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([KMGTPE]?i?B)\b", text, re.IGNORECASE)
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit = match.group(2).upper()
+    factors = {
+        "B": 1,
+        "KIB": 1024,
+        "MIB": 1024**2,
+        "GIB": 1024**3,
+        "TIB": 1024**4,
+        "PIB": 1024**5,
+        "EIB": 1024**6,
+        "KB": 1000,
+        "MB": 1000**2,
+        "GB": 1000**3,
+        "TB": 1000**4,
+        "PB": 1000**5,
+        "EB": 1000**6,
+    }
+    factor = factors.get(unit)
+    if factor is None:
+        return None
+    return int(amount * factor)
+
+
 def format_duration_compact(seconds: int | float) -> str:
     total = max(int(seconds), 0)
     days, remainder = divmod(total, 86400)
@@ -212,6 +254,18 @@ def format_duration_compact(seconds: int | float) -> str:
         parts.append(f"{hours}h")
     parts.append(f"{minutes}m")
     return " ".join(parts)
+
+
+def format_eta(seconds: int | float) -> str:
+    total = max(int(seconds), 0)
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        minutes, secs = divmod(total, 60)
+        if secs >= 30:
+            minutes += 1
+        return f"{minutes}m"
+    return format_duration_compact(total)
 
 
 def shorten(value: str, limit: int = 120) -> str:
@@ -294,6 +348,8 @@ class MonitorBackend:
         self.package_stop_event = threading.Event()
         self.package_worker: threading.Thread | None = None
         self.package_worker_started = False
+        sort_mode = os.environ.get("MONITOR_PACKAGE_SORT", "size").strip().lower()
+        self.package_sort_mode = sort_mode if sort_mode in {"size", "name"} else "size"
 
     def cached(self, key: str, ttl: float, producer: Callable[[], object]) -> object:
         now = time.time()
@@ -919,6 +975,10 @@ class MonitorBackend:
     def request_package_refresh(self) -> None:
         self.package_force_event.set()
 
+    def cycle_package_sort_mode(self) -> str:
+        self.package_sort_mode = "name" if self.package_sort_mode == "size" else "size"
+        return self.package_sort_mode
+
     def _package_refresh_loop(self) -> None:
         next_refresh = 0.0
         while not self.package_stop_event.is_set():
@@ -997,6 +1057,162 @@ class MonitorBackend:
         if warnings:
             lines.append("Refresh warnings: " + " | ".join(warnings))
         return lines
+
+    @staticmethod
+    def _package_meta_cache_key(prefix: str, updates: dict[str, tuple[str, str]]) -> str:
+        digest = hashlib.sha1(
+            "\n".join(
+                f"{name}\t{current}\t{latest}"
+                for name, (current, latest) in sorted(updates.items())
+            ).encode("utf-8")
+        ).hexdigest()
+        return f"{prefix}:{digest}"
+
+    @staticmethod
+    def _parse_info_blocks(text: str) -> list[dict[str, str]]:
+        blocks: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+        last_key: str | None = None
+        for raw in text.splitlines():
+            if not raw.strip():
+                if current:
+                    blocks.append(current)
+                    current = {}
+                    last_key = None
+                continue
+            if ":" in raw:
+                key, value = raw.split(":", 1)
+                key = key.strip()
+                if key:
+                    current[key] = value.strip()
+                    last_key = key
+                    continue
+            if last_key is not None:
+                current[last_key] = (current[last_key] + " " + raw.strip()).strip()
+        if current:
+            blocks.append(current)
+        return blocks
+
+    def _repo_update_metadata(self, updates: dict[str, tuple[str, str]]) -> tuple[dict[str, dict[str, int | str | None]], str | None]:
+        if not updates:
+            return {}, None
+        names = sorted(updates)
+        timeout = min(max(8.0, len(names) * 0.4), 30.0)
+        result = run_command(["pacman", "-Si", *names], timeout=timeout)
+        if not result.stdout:
+            if result.missing:
+                return {}, "pacman not found"
+            if result.timed_out:
+                return {}, "pacman -Si timed out"
+            if result.stderr:
+                return {}, shorten(single_line(result.stderr), 120)
+            return {}, "pacman -Si returned no data"
+        metadata: dict[str, dict[str, int | str | None]] = {}
+        for block in self._parse_info_blocks(result.stdout):
+            name = block.get("Name")
+            if not name:
+                continue
+            metadata[name] = {
+                "version": block.get("Version"),
+                "download_size": parse_size_bytes(block.get("Download Size", "")),
+                "installed_size": parse_size_bytes(block.get("Installed Size", "")),
+            }
+        return metadata, None
+
+    def _aur_update_metadata(self, updates: dict[str, tuple[str, str]]) -> tuple[dict[str, dict[str, int | str | None]], str | None]:
+        if not updates:
+            return {}, None
+        names = sorted(updates)
+        timeout = min(max(10.0, len(names) * 0.5), 40.0)
+        result = run_command(["yay", "-Si", "--aur", *names], timeout=timeout)
+        if not result.stdout:
+            if result.missing:
+                return {}, "yay not found"
+            if result.timed_out:
+                return {}, "yay -Si timed out"
+            if result.stderr:
+                return {}, shorten(single_line(result.stderr), 120)
+            return {}, "yay -Si returned no data"
+        metadata: dict[str, dict[str, int | str | None]] = {}
+        for block in self._parse_info_blocks(result.stdout):
+            name = block.get("Name")
+            if not name:
+                continue
+            metadata[name] = {
+                "version": block.get("Version"),
+                "download_size": (
+                    parse_size_bytes(block.get("Download Size", ""))
+                    or parse_size_bytes(block.get("Package Size", ""))
+                ),
+                "installed_size": (
+                    parse_size_bytes(block.get("Installed Size", ""))
+                    or parse_size_bytes(block.get("Package Size", ""))
+                ),
+            }
+        return metadata, None
+
+    def _pending_update_rows(self, state: PackageRefreshState) -> tuple[list[PackageUpdateRow], list[str]]:
+        notes: list[str] = []
+        repo_meta: dict[str, dict[str, int | str | None]] = {}
+        aur_meta: dict[str, dict[str, int | str | None]] = {}
+
+        if state.official_updates and not state.official_error:
+            repo_meta, repo_error = self.cached(
+                self._package_meta_cache_key("repo_meta", state.official_updates),
+                PACKAGE_METADATA_INTERVAL,
+                lambda: self._repo_update_metadata(state.official_updates),
+            )
+            if repo_error:
+                notes.append(f"repo size metadata unavailable ({repo_error})")
+
+        if state.aur_updates and not state.aur_error:
+            aur_meta, aur_error = self.cached(
+                self._package_meta_cache_key("aur_meta", state.aur_updates),
+                PACKAGE_METADATA_INTERVAL,
+                lambda: self._aur_update_metadata(state.aur_updates),
+            )
+            if aur_error:
+                notes.append(f"AUR size metadata unavailable ({aur_error})")
+
+        rows: list[PackageUpdateRow] = []
+        for name, (current, latest) in state.official_updates.items():
+            meta = repo_meta.get(name, {})
+            rows.append(
+                PackageUpdateRow(
+                    source="repo",
+                    name=name,
+                    current=current,
+                    latest=latest,
+                    download_size=meta.get("download_size") if isinstance(meta, dict) else None,
+                    installed_size=meta.get("installed_size") if isinstance(meta, dict) else None,
+                )
+            )
+        for name, (current, latest) in state.aur_updates.items():
+            meta = aur_meta.get(name, {})
+            rows.append(
+                PackageUpdateRow(
+                    source="aur",
+                    name=name,
+                    current=current,
+                    latest=latest,
+                    download_size=meta.get("download_size") if isinstance(meta, dict) else None,
+                    installed_size=meta.get("installed_size") if isinstance(meta, dict) else None,
+                )
+            )
+        return rows, notes
+
+    def _sorted_pending_rows(self, rows: Sequence[PackageUpdateRow]) -> list[PackageUpdateRow]:
+        if self.package_sort_mode == "name":
+            return sorted(rows, key=lambda row: (row.name.lower(), row.source))
+        return sorted(
+            rows,
+            key=lambda row: (
+                0 if row.download_size is not None else 1,
+                -(row.download_size or 0),
+                row.name.lower(),
+                row.source,
+            ),
+        )
 
     def _installed_packages(self) -> dict[str, str]:
         result = run_command(["pacman", "-Q"], timeout=6.0)
@@ -1221,34 +1437,82 @@ class MonitorBackend:
     def collect_pending_updates(self) -> list[str]:
         state = self._package_state_snapshot()
         lines = self._package_refresh_lines(state)
+        rows, meta_notes = self._pending_update_rows(state)
+        sorted_rows = self._sorted_pending_rows(rows)
 
         if state.official_error or state.aur_error:
             total_summary = "unknown"
         else:
             total_summary = str(len(state.official_updates) + len(state.aur_updates))
+        sort_label = "size desc" if self.package_sort_mode == "size" else "name asc"
+        lines.append(f"Sort: {sort_label} | press s to toggle size/name")
         lines.append(
             "Summary: "
             + f"{total_summary} total pending | {len(state.official_updates) if not state.official_error else '?'} repo"
             + f" | {len(state.aur_updates) if not state.aur_error else '?'} AUR"
         )
-
-        if state.official_updates:
-            lines.append(f"Official repo updates: {len(state.official_updates)} pending")
-            for name, (current, latest) in sorted(state.official_updates.items()):
-                lines.append(f"  {shorten(f'{name} {current} -> {latest}', 140)}")
-        elif state.official_error:
-            lines.append(f"Official repo updates: unavailable ({state.official_error})")
+        if state.official_error:
+            lines.append(f"Repo backlog: unavailable ({state.official_error})")
         else:
-            lines.append("Official repo updates: 0 pending")
-
-        if state.aur_updates:
-            lines.append(f"AUR updates: {len(state.aur_updates)} pending")
-            for name, (current, latest) in sorted(state.aur_updates.items()):
-                lines.append(f"  {shorten(f'{name} {current} -> {latest}', 140)}")
-        elif state.aur_error:
-            lines.append(f"AUR updates: unavailable ({state.aur_error})")
+            lines.append(f"Repo backlog: {len(state.official_updates)} packages")
+        if state.aur_error:
+            lines.append(f"AUR backlog: unavailable ({state.aur_error})")
         else:
-            lines.append("AUR updates: 0 pending")
+            lines.append(f"AUR backlog: {len(state.aur_updates)} packages")
+        known_download_total = sum(row.download_size or 0 for row in rows)
+        known_installed_total = sum(row.installed_size or 0 for row in rows)
+        known_download_count = sum(1 for row in rows if row.download_size is not None)
+        known_installed_count = sum(1 for row in rows if row.installed_size is not None)
+        if rows:
+            lines.append(
+                "Known download size: "
+                + f"{format_bytes(known_download_total)} across {known_download_count}/{len(rows)} packages"
+            )
+            lines.append(
+                "Known installed footprint: "
+                + f"{format_bytes(known_installed_total)} across {known_installed_count}/{len(rows)} packages"
+            )
+            estimate_seconds = (
+                known_download_total / PACKAGE_EST_DOWNLOAD_BYTES_PER_SEC
+                + len(state.official_updates) * 5
+                + len(state.aur_updates) * PACKAGE_EST_AUR_SECONDS
+            )
+            estimate_line = (
+                f"Estimated update time: ~{format_eta(estimate_seconds)} "
+                + f"(10 MiB/s + {PACKAGE_EST_AUR_SECONDS}s per AUR package)"
+            )
+            if known_download_count < len(rows):
+                lines.append("? " + estimate_line + " with partial size data")
+            else:
+                lines.append(estimate_line)
+        else:
+            lines.append("Known download size: 0 B across 0/0 packages")
+            lines.append("Known installed footprint: 0 B across 0/0 packages")
+            lines.append("Estimated update time: 0s")
+
+        if meta_notes:
+            lines.append("? Size metadata: " + " | ".join(meta_notes))
+
+        if sorted_rows:
+            lines.append("Updates:")
+            for row in sorted_rows:
+                source_label = "[repo]" if row.source == "repo" else "[AUR]"
+                size_parts = []
+                if row.download_size is not None:
+                    size_parts.append(f"dl {format_bytes(row.download_size)}")
+                if row.installed_size is not None:
+                    size_parts.append(f"installed {format_bytes(row.installed_size)}")
+                if not size_parts:
+                    size_parts.append("size ?")
+                lines.append(
+                    "  "
+                    + shorten(
+                        f"{source_label} {row.name} {row.current} -> {row.latest} | " + " | ".join(size_parts),
+                        160,
+                    )
+                )
+        elif not state.official_error and not state.aur_error:
+            lines.append("Updates: none")
         return lines
 
     def _filesystem_usage(self) -> list[dict[str, str | int]]:
@@ -2831,9 +3095,11 @@ class MonitorBackend:
         booted_at = datetime.fromtimestamp(time.time() - uptime_seconds).strftime("%Y-%m-%d %H:%M")
         return f"Uptime: {format_duration_compact(uptime_seconds)} | booted {booted_at}"
 
+    def collect_uptime(self) -> list[str]:
+        return [self._uptime_summary()]
+
     def collect_boot(self) -> list[str]:
         lines = [
-            self._uptime_summary(),
             f"Boot time: {self.cached('boot_time', 300.0, self._boot_time)}",
             "Slowest boot services:",
         ]
@@ -2861,6 +3127,7 @@ class DashboardModel:
         return [
             Collector("top_problems", "tier1", "Top Problems", 15, backend.collect_top_problems),
             Collector("diff_snapshot", "tier1", "Diff Snapshot", 15, backend.collect_diff_snapshot),
+            Collector("uptime", "tier1", "Uptime", 15, backend.collect_uptime),
             Collector("snapshot_health", "tier1", "Privileged Snapshot", 15, backend.collect_snapshot_health),
             Collector("packages", "tier1", "Kernel / Firmware / NVIDIA", 5, backend.collect_packages),
             Collector("storage", "tier1", "Storage / Capacity", 20, backend.collect_storage),
@@ -2932,6 +3199,10 @@ class DashboardModel:
 
     def request_refresh(self) -> None:
         self.backend.request_package_refresh()
+        self.force_refresh.set()
+
+    def toggle_package_sort(self) -> None:
+        self.backend.cycle_package_sort_mode()
         self.force_refresh.set()
 
     def snapshot(self, tab: str) -> list[tuple[Collector, SectionState]]:
@@ -3031,6 +3302,8 @@ class DashboardUI:
                 self.scroll_offsets[self.active_tab] = 10**9
             elif key in (ord("r"), ord("R")):
                 self.model.request_refresh()
+            elif key in (ord("s"), ord("S")) and self.active_tab == "packages":
+                self.model.toggle_package_sort()
 
     def draw(self, stdscr: curses.window) -> None:
         height, width = stdscr.getmaxyx()
@@ -3067,7 +3340,7 @@ class DashboardUI:
             col += len(label) + 1
 
     def _draw_help(self, stdscr: curses.window, width: int) -> None:
-        help_text = "Left/Right switch tabs | Up/Down scroll | r refresh | q quit | green ok | yellow watch | red problem"
+        help_text = "Left/Right switch tabs | Up/Down scroll | r refresh | s sort packages | q quit | green ok | yellow watch | red problem"
         self._safe_addstr(stdscr, 1, 0, help_text[: max(width - 1, 1)], curses.A_DIM)
 
     def _tab_lines(self, width: int) -> list[str]:
@@ -3155,6 +3428,8 @@ class DashboardUI:
             return True
         if stripped == "No high-signal changes since the last diff snapshot.":
             return True
+        if stripped == "Updates: none":
+            return True
         if stripped.startswith("Uptime:"):
             return True
         if lowered.endswith(" current"):
@@ -3172,6 +3447,10 @@ class DashboardUI:
         if stripped.startswith("AUR updates:") and "0 pending" in lowered:
             return True
         if stripped.startswith("Pending updates:") and parse_int(stripped) == 0:
+            return True
+        if stripped.startswith("Repo backlog:") and "unavailable" not in lowered and parse_int(stripped) == 0:
+            return True
+        if stripped.startswith("AUR backlog:") and "unavailable" not in lowered and parse_int(stripped) == 0:
             return True
         if stripped.startswith("Tracked critical packages outdated:") and parse_int(stripped) == 0:
             return True
