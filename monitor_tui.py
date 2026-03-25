@@ -20,12 +20,13 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 
-TAB_ORDER = ("tier1", "tier2", "tier3", "packages")
+TAB_ORDER = ("tier1", "tier2", "tier3", "packages", "aur")
 TAB_TITLES = {
     "tier1": "Tier 1",
     "tier2": "Tier 2",
     "tier3": "Tier 3",
     "packages": "Packages",
+    "aur": "AUR",
 }
 PACKAGE_REFRESH_INTERVAL = 900
 PACKAGE_METADATA_INTERVAL = 600
@@ -1434,11 +1435,14 @@ class MonitorBackend:
             lines.append("  no tracked NVIDIA package installed")
         return lines
 
-    def collect_pending_updates(self) -> list[str]:
+    def _collect_update_backlog(self, source: str) -> list[str]:
         state = self._package_state_snapshot()
         lines = self._package_refresh_lines(state)
         rows, meta_notes = self._pending_update_rows(state)
-        sorted_rows = self._sorted_pending_rows(rows)
+        filtered_rows = [row for row in rows if row.source == source]
+        sorted_rows = self._sorted_pending_rows(filtered_rows)
+        repo_count = len(state.official_updates) if not state.official_error else None
+        aur_count = len(state.aur_updates) if not state.aur_error else None
 
         if state.official_error or state.aur_error:
             total_summary = "unknown"
@@ -1447,41 +1451,42 @@ class MonitorBackend:
         sort_label = "size desc" if self.package_sort_mode == "size" else "name asc"
         lines.append(f"Sort: {sort_label} | press s to toggle size/name")
         lines.append(
-            "Summary: "
-            + f"{total_summary} total pending | {len(state.official_updates) if not state.official_error else '?'} repo"
-            + f" | {len(state.aur_updates) if not state.aur_error else '?'} AUR"
+            "Backlog: "
+            + f"{total_summary} total | {repo_count if repo_count is not None else '?'} repo"
+            + f" | {aur_count if aur_count is not None else '?'} AUR"
         )
-        if state.official_error:
-            lines.append(f"Repo backlog: unavailable ({state.official_error})")
+
+        if source == "repo":
+            if state.official_error:
+                lines.append(f"Repo backlog: unavailable ({state.official_error})")
+            else:
+                lines.append(f"Repo backlog: {len(state.official_updates)} packages")
         else:
-            lines.append(f"Repo backlog: {len(state.official_updates)} packages")
-        if state.aur_error:
-            lines.append(f"AUR backlog: unavailable ({state.aur_error})")
-        else:
-            lines.append(f"AUR backlog: {len(state.aur_updates)} packages")
-        known_download_total = sum(row.download_size or 0 for row in rows)
-        known_installed_total = sum(row.installed_size or 0 for row in rows)
-        known_download_count = sum(1 for row in rows if row.download_size is not None)
-        known_installed_count = sum(1 for row in rows if row.installed_size is not None)
-        if rows:
+            if state.aur_error:
+                lines.append(f"AUR backlog: unavailable ({state.aur_error})")
+            else:
+                lines.append(f"AUR backlog: {len(state.aur_updates)} packages")
+
+        known_download_total = sum(row.download_size or 0 for row in filtered_rows)
+        known_installed_total = sum(row.installed_size or 0 for row in filtered_rows)
+        known_download_count = sum(1 for row in filtered_rows if row.download_size is not None)
+        known_installed_count = sum(1 for row in filtered_rows if row.installed_size is not None)
+        if filtered_rows:
             lines.append(
                 "Known download size: "
-                + f"{format_bytes(known_download_total)} across {known_download_count}/{len(rows)} packages"
+                + f"{format_bytes(known_download_total)} across {known_download_count}/{len(filtered_rows)} packages"
             )
             lines.append(
                 "Known installed footprint: "
-                + f"{format_bytes(known_installed_total)} across {known_installed_count}/{len(rows)} packages"
+                + f"{format_bytes(known_installed_total)} across {known_installed_count}/{len(filtered_rows)} packages"
             )
             estimate_seconds = (
                 known_download_total / PACKAGE_EST_DOWNLOAD_BYTES_PER_SEC
-                + len(state.official_updates) * 5
-                + len(state.aur_updates) * PACKAGE_EST_AUR_SECONDS
+                + (len(filtered_rows) * (5 if source == "repo" else PACKAGE_EST_AUR_SECONDS))
             )
-            estimate_line = (
-                f"Estimated update time: ~{format_eta(estimate_seconds)} "
-                + f"(10 MiB/s + {PACKAGE_EST_AUR_SECONDS}s per AUR package)"
-            )
-            if known_download_count < len(rows):
+            per_pkg_label = "5s per repo package" if source == "repo" else f"{PACKAGE_EST_AUR_SECONDS}s per AUR package"
+            estimate_line = f"Estimated update time: ~{format_eta(estimate_seconds)} (10 MiB/s + {per_pkg_label})"
+            if known_download_count < len(filtered_rows):
                 lines.append("? " + estimate_line + " with partial size data")
             else:
                 lines.append(estimate_line)
@@ -1490,7 +1495,7 @@ class MonitorBackend:
             lines.append("Known installed footprint: 0 B across 0/0 packages")
             lines.append("Estimated update time: 0s")
 
-        if meta_notes:
+        if meta_notes and filtered_rows:
             lines.append("? Size metadata: " + " | ".join(meta_notes))
 
         if sorted_rows:
@@ -1511,9 +1516,17 @@ class MonitorBackend:
                         160,
                     )
                 )
-        elif not state.official_error and not state.aur_error:
+        elif source == "repo" and not state.official_error:
+            lines.append("Updates: none")
+        elif source == "aur" and not state.aur_error:
             lines.append("Updates: none")
         return lines
+
+    def collect_pending_updates(self) -> list[str]:
+        return self._collect_update_backlog("repo")
+
+    def collect_aur_updates(self) -> list[str]:
+        return self._collect_update_backlog("aur")
 
     def _filesystem_usage(self) -> list[dict[str, str | int]]:
         result = run_command(["df", "-PT", "-B1"], timeout=4.0)
@@ -3143,7 +3156,8 @@ class DashboardModel:
             Collector("security", "tier3", "Security / Exposure Surface", 30, backend.collect_security),
             Collector("hygiene", "tier3", "System Hygiene", 300, backend.collect_hygiene),
             Collector("boot", "tier3", "Boot / Regression Signals", 300, backend.collect_boot),
-            Collector("pending_updates", "packages", "Pending Updates", 15, backend.collect_pending_updates),
+            Collector("pending_updates", "packages", "Official Repo Updates", 15, backend.collect_pending_updates),
+            Collector("aur_updates", "aur", "AUR Updates", 15, backend.collect_aur_updates),
         ]
 
     def start_background_tasks(self) -> None:
@@ -3302,7 +3316,7 @@ class DashboardUI:
                 self.scroll_offsets[self.active_tab] = 10**9
             elif key in (ord("r"), ord("R")):
                 self.model.request_refresh()
-            elif key in (ord("s"), ord("S")) and self.active_tab == "packages":
+            elif key in (ord("s"), ord("S")) and self.active_tab in {"packages", "aur"}:
                 self.model.toggle_package_sort()
 
     def draw(self, stdscr: curses.window) -> None:
@@ -3340,7 +3354,7 @@ class DashboardUI:
             col += len(label) + 1
 
     def _draw_help(self, stdscr: curses.window, width: int) -> None:
-        help_text = "Left/Right switch tabs | Up/Down scroll | r refresh | s sort packages | q quit | green ok | yellow watch | red problem"
+        help_text = "Left/Right switch tabs | Up/Down scroll | r refresh | s sort package tabs | q quit | green ok | yellow watch | red problem"
         self._safe_addstr(stdscr, 1, 0, help_text[: max(width - 1, 1)], curses.A_DIM)
 
     def _tab_lines(self, width: int) -> list[str]:

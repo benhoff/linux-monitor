@@ -7,7 +7,8 @@ It groups the dashboard into three tabs:
 - `Tier 1`: kernel/firmware/NVIDIA package tracking, storage, systemd health, journal errors
 - `Tier 2`: memory pressure, CPU/load, thermal state, hardware health, filesystem integrity, device-specific signals
 - `Tier 3`: network state, exposure surface, hygiene, boot regressions
-- `Packages`: full pending update backlog with repo/AUR counts, size totals, ETA, and per-package rows
+- `Packages`: official repo update backlog with size totals, ETA, and per-package rows
+- `AUR`: AUR update backlog with size totals, ETA, and per-package rows
 
 ## Run
 
@@ -36,6 +37,7 @@ python3 monitor_tui.py
 python3 monitor_tui.py --once --tab tier1
 python3 monitor_tui.py --once --tab tier2
 python3 monitor_tui.py --once --tab packages
+python3 monitor_tui.py --once --tab aur
 python3 monitor_tui.py --once --tab all
 ```
 
