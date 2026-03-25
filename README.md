@@ -57,6 +57,12 @@ Write a snapshot manually:
 sudo python3 monitor_privileged_snapshot.py --output /run/monitor/privileged_snapshot.json
 ```
 
+Install the privileged snapshot service and timer:
+
+```bash
+./install_monitor_privileged.sh
+```
+
 Use a different snapshot path:
 
 ```bash
@@ -68,4 +74,4 @@ Example systemd unit templates are in:
 - `contrib/systemd/monitor-privileged-snapshot.service`
 - `contrib/systemd/monitor-privileged-snapshot.timer`
 
-Edit `ExecStart` in the service file to point at your real repo path before installing it.
+The installer writes concrete unit files into `/etc/systemd/system` and prompts for `sudo` automatically.

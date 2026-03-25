@@ -525,6 +525,8 @@ class MonitorBackend:
             self.refresh_package_state_sync()
 
         installed = self.cached("installed_packages", 30.0, self._installed_packages)
+        foreign, foreign_error = self.cached("foreign", 900.0, self._foreign_packages)
+        ignored = self.cached("ignored", 1800.0, self._ignored_packages)
         running_kernel = self._running_kernel_version()
         nvidia_module = self._nvidia_module_version()
         with self.package_lock:
@@ -538,6 +540,7 @@ class MonitorBackend:
             )
 
         lines: list[str] = []
+        total_pending = len(state.official_updates) + len(state.aur_updates)
         if state.loading and state.last_updated == 0.0:
             lines.append("Background refresh: syncing latest package metadata...")
         elif state.loading:
@@ -554,10 +557,41 @@ class MonitorBackend:
         if warnings:
             lines.append("Refresh warnings: " + " | ".join(warnings))
 
-        lines.append("Kernel:")
-        lines.append(f"  running kernel: {running_kernel}")
         kernel_updates = {**state.aur_updates, **state.official_updates}
         kernel_packages = self._tracked_kernel_packages(installed)
+        firmware_packages = self._tracked_firmware_versions(installed)
+        nvidia_packages = self._tracked_nvidia_packages(installed)
+        tracked_rows = [
+            *[(name, version) for name, version in kernel_packages],
+            *[(name, version) for name, version in firmware_packages],
+            *[(name, version) for name, version in nvidia_packages],
+        ]
+        tracked_outdated = sum(
+            1
+            for name, version in tracked_rows
+            if (latest := self._latest_version_for(name, kernel_updates)) is not None and latest != version
+        )
+
+        lines.append("Summary:")
+        repo_summary = "?" if state.official_error else str(len(state.official_updates))
+        aur_summary = "?" if state.aur_error else str(len(state.aur_updates))
+        total_summary = (
+            "unknown"
+            if state.official_error or state.aur_error
+            else str(total_pending)
+        )
+        lines.append(
+            f"  Pending updates: {total_summary} total | {repo_summary} repo | {aur_summary} AUR"
+        )
+        lines.append(
+            f"  Installed foreign packages: {len(foreign)}"
+            + (f" ({foreign_error})" if foreign_error else "")
+            + f" | ignored packages: {len(ignored)}"
+        )
+        lines.append(f"  Tracked critical packages outdated: {tracked_outdated}/{len(tracked_rows)}")
+
+        lines.append("Kernel:")
+        lines.append(f"  running kernel: {running_kernel}")
         if kernel_packages:
             for name, version in kernel_packages:
                 latest = self._latest_version_for(name, kernel_updates)
@@ -566,7 +600,6 @@ class MonitorBackend:
             lines.append("  no tracked kernel package installed")
 
         lines.append("Firmware:")
-        firmware_packages = self._tracked_firmware_versions(installed)
         if firmware_packages:
             for name, version in firmware_packages:
                 latest = self._latest_version_for(name, kernel_updates)
@@ -576,7 +609,6 @@ class MonitorBackend:
 
         lines.append("NVIDIA:")
         lines.append(f"  loaded module: {nvidia_module}")
-        nvidia_packages = self._tracked_nvidia_packages(installed)
         if nvidia_packages:
             for name, version in nvidia_packages:
                 latest = self._latest_version_for(name, kernel_updates)
@@ -673,6 +705,23 @@ class MonitorBackend:
         }.get(target, 50)
         return (priority, target)
 
+    @staticmethod
+    def _storage_severity(pct: int, inode_pct: int | None) -> str:
+        inode_value = inode_pct if inode_pct is not None else 0
+        highest = max(pct, inode_value)
+        if highest >= 90:
+            return "critical"
+        if highest >= 75:
+            return "watch"
+        return "healthy"
+
+    @staticmethod
+    def _abbreviate_path(path: str) -> str:
+        home = str(Path.home())
+        if path.startswith(home):
+            return "~" + path[len(home):]
+        return path
+
     def _directory_sizes(self) -> list[tuple[str, int]]:
         sizes: list[tuple[str, int]] = []
         for path in WATCHED_DIRS:
@@ -738,7 +787,6 @@ class MonitorBackend:
         lines: list[str] = []
         fs_entries = self._filesystem_usage()
         inode_usage = self._inode_usage()
-        mounts = self._mount_summary()
         dir_sizes = self.cached("dir_sizes", 300.0, self._directory_sizes)
         read_rate, write_rate, busy_devices = self._disk_rates()
 
@@ -746,50 +794,81 @@ class MonitorBackend:
         if root_entry:
             root_used = int(root_entry["used"])
             root_size = int(root_entry["size"])
+            root_free = int(root_entry["avail"])
             root_pct = int(root_entry["pct"])
             prefix = "! " if root_pct >= 85 else ""
             lines.append(
                 f"{prefix}Root filesystem: {format_bytes(root_used)} used / "
-                f"{format_bytes(root_size)} total ({root_pct}%)"
+                f"{format_bytes(root_size)} total ({root_pct}%) | {format_bytes(root_free)} free"
             )
 
         ordered_entries = sorted(fs_entries, key=self._filesystem_sort_key)
-        display_entries = [entry for entry in ordered_entries if str(entry["target"]) != "/"]
-        if len(display_entries) < 6:
-            extras = [entry for entry in fs_entries if entry not in display_entries and str(entry["target"]) != "/"]
-            extras.sort(key=lambda item: int(item["pct"]), reverse=True)
-            display_entries.extend(extras)
+        by_target = {str(entry["target"]): entry for entry in ordered_entries}
+        display_entries: list[dict[str, str | int]] = []
+        for target in (str(Path.home()), "/var", "/boot", "/boot/efi", "/tmp"):
+            entry = by_target.get(target)
+            if entry is not None:
+                display_entries.append(entry)
 
-        for entry in display_entries[:6]:
+        for entry in ordered_entries:
             target = str(entry["target"])
+            if target == "/" or entry in display_entries:
+                continue
             inode_pct = inode_usage.get(target)
-            inode_suffix = f" | inodes {inode_pct}%" if inode_pct is not None else ""
-            lines.append(
-                f"{target}: {format_bytes(int(entry['used']))} / {format_bytes(int(entry['size']))} "
-                f"({entry['pct']}%) | {entry['fstype']}{inode_suffix}"
-            )
+            if self._storage_severity(int(entry["pct"]), inode_pct) != "healthy":
+                display_entries.append(entry)
 
-        if mounts:
-            lines.append(f"Mounts: {' | '.join(mounts[:5])}")
-        else:
-            lines.append("Mounts: findmnt unavailable.")
+        healthy_count = 0
+        watch_count = 0
+        critical_count = 0
+        for entry in fs_entries:
+            severity = self._storage_severity(int(entry["pct"]), inode_usage.get(str(entry["target"])))
+            if severity == "critical":
+                critical_count += 1
+            elif severity == "watch":
+                watch_count += 1
+            else:
+                healthy_count += 1
 
         lines.append(
-            f"Disk IO: read {format_bytes(read_rate)}/s | write {format_bytes(write_rate)}/s"
+            f"Filesystems: {healthy_count} healthy | {watch_count} watch | {critical_count} critical"
         )
-        if busy_devices:
+
+        lines.append("Key filesystems:")
+        for entry in display_entries[:5]:
+            target = str(entry["target"])
+            inode_pct = inode_usage.get(target)
+            free = int(entry["avail"])
+            inode_suffix = ""
+            if inode_pct is not None and inode_pct >= 75:
+                inode_suffix = f" | inodes {inode_pct}%"
             lines.append(
-                "Busy devices: "
-                + ", ".join(f"{name} {format_bytes(rate)}/s" for name, rate in busy_devices)
+                f"  {target}: {entry['pct']}% used | {format_bytes(free)} free | {entry['fstype']}{inode_suffix}"
             )
 
-        if dir_sizes:
+        if read_rate < 128 * 1024 and write_rate < 128 * 1024:
+            lines.append("Disk IO: idle")
+        else:
             lines.append(
-                "Largest watched dirs: "
-                + ", ".join(f"{path} {format_bytes(size)}" for path, size in dir_sizes[:5])
+                f"Disk IO: read {format_bytes(read_rate)}/s | write {format_bytes(write_rate)}/s"
+            )
+        active_devices = [(name, rate) for name, rate in busy_devices if rate >= 512 * 1024]
+        if active_devices:
+            lines.append(
+                "Active devices: "
+                + ", ".join(f"{name} {format_bytes(rate)}/s" for name, rate in active_devices)
+            )
+
+        noisy_dirs = [(path, size) for path, size in dir_sizes if size >= 1024**3]
+        if noisy_dirs:
+            lines.append(
+                "Growth suspects: "
+                + ", ".join(
+                    f"{self._abbreviate_path(path)} {format_bytes(size)}" for path, size in noisy_dirs[:3]
+                )
             )
         else:
-            lines.append("Largest watched dirs: no readable paths from the watch list.")
+            lines.append("Growth suspects: none above 1 GiB in watched paths.")
         return lines
 
     def _systemd_state(self) -> str:
@@ -2051,6 +2130,10 @@ class DashboardUI:
             return True
         if stripped.startswith("AUR updates:") and "0 pending" in lowered:
             return True
+        if stripped.startswith("Pending updates:") and parse_int(stripped) == 0:
+            return True
+        if stripped.startswith("Tracked critical packages outdated:") and parse_int(stripped) == 0:
+            return True
         if stripped.startswith("Failed services:") and parse_int(stripped) == 0:
             return True
         if stripped.startswith("Failed login attempts this boot:") and parse_int(stripped) == 0:
@@ -2064,10 +2147,12 @@ class DashboardUI:
         if section == "Memory / Pressure" and stripped.startswith("PSI memory:") and "0.00/0.00/0.00" in stripped:
             return True
         if section == "Storage / Capacity":
+            if stripped.startswith("Filesystems:") and "| 0 watch | 0 critical" in stripped:
+                return True
+            if stripped == "Disk IO: idle":
+                return True
             pct = self._percent_value(stripped)
             if pct is not None and pct < 75:
-                return True
-            if stripped.startswith("Mounts:") and " ro" not in stripped:
                 return True
         if "no readable thermal zones" in lowered:
             return False
@@ -2075,6 +2160,8 @@ class DashboardUI:
 
     def _is_warning_line(self, stripped: str, lowered: str, section: str) -> bool:
         if " -> " in stripped:
+            return True
+        if stripped.startswith("Pending updates:") and "unknown" in lowered:
             return True
         if any(token in lowered for token in ("not found", "timed out", "operation not permitted")):
             return True
@@ -2090,6 +2177,12 @@ class DashboardUI:
         if stripped.startswith("AUR updates:"):
             count = parse_int(stripped)
             return 0 < count < 25
+        if stripped.startswith("Pending updates:"):
+            count = parse_int(stripped)
+            return 0 < count < 50
+        if stripped.startswith("Tracked critical packages outdated:"):
+            count = parse_int(stripped)
+            return 0 < count < 3
         if stripped.startswith("Orphans:"):
             count = parse_int(stripped)
             return 0 < count < 50
@@ -2105,6 +2198,8 @@ class DashboardUI:
         if section in {"Thermal / Power", "Hardware Health"} and self._temperature_value(stripped) >= 70:
             return True
         if section == "Storage / Capacity":
+            if stripped.startswith("Filesystems:"):
+                return " | 0 critical" in stripped and " | 0 watch" not in stripped
             pct = self._percent_value(stripped)
             if pct is not None and 75 <= pct < 90:
                 return True
@@ -2120,8 +2215,6 @@ class DashboardUI:
                 return True
         if stripped.startswith("Read-only mounts:") and not stripped.endswith("none"):
             return True
-        if section == "Storage / Capacity" and stripped.startswith("Mounts:") and " ro" in stripped:
-            return True
         return False
 
     def _is_critical_line(self, stripped: str, lowered: str, section: str) -> bool:
@@ -2133,6 +2226,10 @@ class DashboardUI:
             return True
         if stripped.startswith("AUR updates:") and parse_int(stripped) >= 25:
             return True
+        if stripped.startswith("Pending updates:") and parse_int(stripped) >= 50:
+            return True
+        if stripped.startswith("Tracked critical packages outdated:") and parse_int(stripped) >= 3:
+            return True
         if stripped.startswith("Orphans:") and parse_int(stripped) >= 50:
             return True
         if stripped.startswith("Foreign packages:") and parse_int(stripped) >= 75:
@@ -2140,6 +2237,8 @@ class DashboardUI:
         if stripped.startswith("System state:") and any(token in lowered for token in ("degraded", "failed")):
             return True
         if section == "Storage / Capacity":
+            if stripped.startswith("Filesystems:"):
+                return "critical" in lowered and not stripped.endswith("0 critical")
             pct = self._percent_value(stripped)
             if pct is not None and pct >= 90:
                 return True
