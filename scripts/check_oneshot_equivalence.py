@@ -86,9 +86,10 @@ def export_revision(ref: str, dest: Path) -> Path:
     return tree_dir
 
 
-def run_oneshot(tree: Path, tab: str, python_exe: str, run_id: str) -> str:
+def run_oneshot(tree: Path, tab: str, python_exe: str, state_root: Path) -> str:
     env = os.environ.copy()
-    state_root = tree / ".tmp-check-state" / run_id
+    if state_root.exists():
+        shutil.rmtree(state_root)
     state_root.mkdir(parents=True, exist_ok=True)
     env["MONITOR_DIFF_SNAPSHOT"] = str(state_root / "diff_snapshot.json")
     env["XDG_STATE_HOME"] = str(state_root / "xdg-state")
@@ -150,8 +151,8 @@ def main() -> int:
         left_dir = export_revision(args.left, temp_root / "left")
         right_dir = export_revision(args.right, temp_root / "right")
 
-        left_output = run_oneshot(left_dir, args.tab, args.python, "left")
-        right_output = run_oneshot(right_dir, args.tab, args.python, "right")
+        left_output = run_oneshot(left_dir, args.tab, args.python, temp_root / "state-left")
+        right_output = run_oneshot(right_dir, args.tab, args.python, temp_root / "state-right")
 
         if args.keep_temp:
             kept_root = repo_root() / ".tmp-oneshot-equivalence"

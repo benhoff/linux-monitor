@@ -18,6 +18,12 @@ def read_lines(path: Path, limit: int | None = None) -> list[str]:
     return lines
 
 
+def shorten(value: str, limit: int = 120) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
 def parse_int(value: str, default: int = 0) -> int:
     match = re.search(r"-?\d+", value)
     if not match:
