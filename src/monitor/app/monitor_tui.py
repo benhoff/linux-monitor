@@ -49,6 +49,8 @@ from monitor.shared.parsing_network import (
 )
 from monitor.shared.paths import diff_snapshot_state_path, legacy_repo_diff_snapshot_path
 from monitor.shared.text import line_list, parse_float, parse_int, read_lines, read_text, shorten
+from monitor.collectors.capture import CaptureCollector
+from monitor.collectors.networking import BluetoothCollector, NetworkCollector, WifiCollector
 from monitor.collectors.package_monitor import PackageMonitor, PackageRefreshState, PackageUpdateRow
 from monitor.collectors.resources import (
     CpuCollector,
@@ -173,7 +175,11 @@ class MonitorBackend:
         self.package_sort_mode = sort_mode if sort_mode in {"size", "name"} else "size"
         self.logs = LogsCollector(self)
         self.package_monitor = PackageMonitor(self)
+        self.capture = CaptureCollector(self)
         self.memory = MemoryCollector(self)
+        self.network = NetworkCollector(self)
+        self.wifi = WifiCollector(self)
+        self.bluetooth = BluetoothCollector(self)
         self.cpu = CpuCollector(self)
         self.storage = StorageCollector(self)
         self.systemd_health = SystemdHealthCollector(self)
@@ -689,1268 +695,181 @@ class MonitorBackend:
         return self.fs_integrity.collect()
 
     def _drm_connectors(self) -> list[str]:
-        connectors = []
-        for status_path in sorted(Path("/sys/class/drm").glob("card*-*/status")):
-            connector = status_path.parent.name
-            status = read_text(status_path).strip() or "unknown"
-            connectors.append(f"{connector} {status}")
-        return connectors
+        return self.capture.drm_connectors()
 
     @staticmethod
     def _capture_slots(cards: Sequence[str]) -> set[str]:
-        slots: set[str] = set()
-        for raw in cards:
-            match = re.match(r"^([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])\b", raw, re.IGNORECASE)
-            if match:
-                slots.add(match.group(1))
-        return slots
+        return CaptureCollector.capture_slots(cards)
 
     def _capture_cards(self) -> list[str]:
-        result = run_command(["lspci", "-D", "-nn", "-k"], timeout=4.0)
-        if not result.stdout:
-            return []
-        cards = []
-        blocks = re.split(r"\n(?=[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]\s)", result.stdout, flags=re.IGNORECASE)
-        for block in blocks:
-            lines = [line.rstrip() for line in block.splitlines() if line.strip()]
-            if not lines:
-                continue
-            header = lines[0].strip()
-            lowered = header.lower()
-            if "avmatrix" not in lowered and "multimedia video controller" not in lowered and "capture" not in lowered:
-                continue
-            driver = ""
-            modules = ""
-            for raw in lines[1:]:
-                stripped = raw.strip()
-                lowered_detail = stripped.lower()
-                if lowered_detail.startswith("kernel driver in use:"):
-                    driver = stripped.split(":", 1)[1].strip()
-                elif lowered_detail.startswith("kernel modules:"):
-                    modules = stripped.split(":", 1)[1].strip()
-            summary = header
-            if driver:
-                summary += f" | driver {driver}"
-            elif modules:
-                summary += f" | modules {modules}"
-            cards.append(summary)
-        return cards[:6]
+        return self.capture.capture_cards()
 
     def _capture_modules(self) -> list[str]:
-        result = run_command(["lsmod"], timeout=3.0)
-        if not result.stdout:
-            return []
-        modules = []
-        for raw in line_list(result.stdout):
-            name = raw.split()[0]
-            if name in CAPTURE_STACK_MODULES:
-                modules.append(name)
-        return modules
+        return self.capture.capture_modules()
 
     def _capture_driver_params(self) -> list[str]:
-        params_dir = Path("/sys/module/HwsCapture/parameters")
-        if not params_dir.exists():
-            return []
-        params = []
-        for path in sorted(params_dir.iterdir()):
-            if path.is_file():
-                params.append(f"{path.name}={read_text(path).strip()}")
-        return params
+        return self.capture.capture_driver_params()
 
     @staticmethod
     def _capture_driver_overrides(params: Sequence[str]) -> list[str]:
-        overrides = []
-        for item in params:
-            lowered = item.lower()
-            if lowered.endswith("=n") or lowered.endswith("=0") or lowered.endswith("=false"):
-                continue
-            overrides.append(item)
-        return overrides
+        return CaptureCollector.capture_driver_overrides(params)
 
     @staticmethod
     def _capture_card_brief(card: str) -> str:
-        slot_match = re.match(r"^([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])\s+", card, re.IGNORECASE)
-        slot = slot_match.group(1) if slot_match else "unknown"
-        description = card
-        if ": " in description:
-            description = description.split(": ", 1)[1]
-        if " | " in description:
-            description = description.split(" | ", 1)[0]
-        description = description.replace("Silicon Magic ", "")
-        driver_match = re.search(r"\|\s*driver\s+(.+)$", card)
-        driver = driver_match.group(1).strip() if driver_match else "unknown"
-        return shorten(f"{slot} | {description} | {driver}", 120)
+        return CaptureCollector.capture_card_brief(card)
 
     @staticmethod
     def _probe_v4l2_node(node: str) -> dict[str, str]:
-        info: dict[str, str] = {}
-        result = run_command(["v4l2-ctl", "-D", "-d", node], timeout=3.0)
-        if result.stdout:
-            for raw in result.stdout.splitlines():
-                if ":" not in raw:
-                    continue
-                key, value = [part.strip() for part in raw.split(":", 1)]
-                if key in {"Driver name", "Card type", "Bus info"}:
-                    info[key] = value
-        fmt_result = run_command(["v4l2-ctl", "--get-fmt-video", "-d", node], timeout=3.0)
-        if fmt_result.stdout:
-            width = None
-            height = None
-            pixfmt = None
-            for raw in fmt_result.stdout.splitlines():
-                raw = raw.strip()
-                if raw.startswith("Width/Height"):
-                    match = re.search(r"(\d+)\s*/\s*(\d+)", raw)
-                    if match:
-                        width, height = match.groups()
-                elif raw.startswith("Pixel Format"):
-                    match = re.search(r"'([^']+)'", raw)
-                    if match:
-                        pixfmt = match.group(1)
-            if width and height:
-                info["Format"] = f"{width}x{height}" + (f" {pixfmt}" if pixfmt else "")
-        return info
+        return CaptureCollector.probe_v4l2_node(node)
 
     def _sysfs_v4l2_nodes(self) -> list[dict[str, object]]:
-        root = Path("/sys/class/video4linux")
-        if not root.exists():
-            return []
-        nodes: list[dict[str, object]] = []
-        for path in sorted(root.glob("video*")):
-            devname = f"/dev/{path.name}"
-            resolved = str(path.resolve())
-            slots = re.findall(r"(0000:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])", resolved, re.IGNORECASE)
-            nodes.append(
-                {
-                    "sysfs_name": path.name,
-                    "label": read_text(path / "name").strip() or path.name,
-                    "devname": devname,
-                    "present": Path(devname).exists(),
-                    "major_minor": read_text(path / "dev").strip() or "unknown",
-                    "index": read_text(path / "index").strip() or "",
-                    "slot": slots[-1] if slots else "unknown",
-                    "detail": self._probe_v4l2_node(devname) if Path(devname).exists() else {},
-                }
-            )
-        return nodes
+        return self.capture.sysfs_v4l2_nodes()
 
     @staticmethod
     def _format_sysfs_v4l2_node(entry: dict[str, object]) -> str:
-        label = str(entry.get("label") or entry.get("sysfs_name") or "video")
-        devname = str(entry.get("devname") or entry.get("sysfs_name") or "unknown")
-        state = "present" if entry.get("present") else "missing"
-        parts = [f"{devname} {state}"]
-        major_minor = str(entry.get("major_minor") or "")
-        if major_minor and major_minor != "unknown":
-            parts.append(major_minor)
-        slot = str(entry.get("slot") or "")
-        if slot and slot != "unknown":
-            parts.append(f"pci {slot}")
-        detail = entry.get("detail")
-        if isinstance(detail, dict):
-            for key in ("Driver name", "Card type", "Format"):
-                value = detail.get(key)
-                if value:
-                    parts.append(str(value))
-        return f"{label}: {' | '.join(parts)}"
+        return CaptureCollector.format_sysfs_v4l2_node(entry)
 
     def _v4l2_inventory(self) -> dict[str, object]:
-        sysfs_nodes = self._sysfs_v4l2_nodes()
-        video_nodes = sorted(str(path) for path in Path("/dev").glob("video*"))
-        media_nodes = sorted(str(path) for path in Path("/dev").glob("media*"))
-        result = run_command(["v4l2-ctl", "--list-devices"], timeout=4.0)
-        if result.missing:
-            return {
-                "video_nodes": video_nodes,
-                "media_nodes": media_nodes,
-                "sysfs_nodes": sysfs_nodes,
-                "userspace_lines": ["v4l2-ctl not found."],
-            }
-        if result.stderr:
-            return {
-                "video_nodes": video_nodes,
-                "media_nodes": media_nodes,
-                "sysfs_nodes": sysfs_nodes,
-                "userspace_lines": [shorten(single_line(result.stderr), 140)],
-            }
-        if not result.stdout:
-            if sysfs_nodes:
-                userspace_lines = [f"No V4L2 devices listed despite {len(sysfs_nodes)} kernel video4linux channel(s)."]
-            else:
-                userspace_lines = ["No V4L2 devices listed."]
-            return {
-                "video_nodes": video_nodes,
-                "media_nodes": media_nodes,
-                "sysfs_nodes": sysfs_nodes,
-                "userspace_lines": userspace_lines,
-            }
-
-        devices: list[dict[str, object]] = []
-        current: dict[str, object] | None = None
-        for raw in result.stdout.splitlines():
-            if raw and not raw.startswith("\t"):
-                current = {"name": raw.strip().rstrip(":"), "nodes": []}
-                devices.append(current)
-            elif current is not None and raw.strip():
-                current["nodes"].append(raw.strip())
-
-        lines = []
-        for device in devices[:6]:
-            nodes = [node for node in device.get("nodes", []) if node.startswith("/dev/video")]
-            media = [node for node in device.get("nodes", []) if node.startswith("/dev/media")]
-            primary = nodes[0] if nodes else (media[0] if media else None)
-            detail = self._probe_v4l2_node(primary) if primary and Path(primary).exists() else {}
-            detail_parts = []
-            if detail.get("Driver name"):
-                detail_parts.append(detail["Driver name"])
-            if detail.get("Card type"):
-                detail_parts.append(detail["Card type"])
-            if detail.get("Bus info"):
-                detail_parts.append(detail["Bus info"])
-            if detail.get("Format"):
-                detail_parts.append(detail["Format"])
-            node_summary = ", ".join(nodes[:4] + media[:2]) if nodes or media else "no nodes"
-            suffix = f" | {' | '.join(detail_parts)}" if detail_parts else ""
-            lines.append(f"{device['name']}: {node_summary}{suffix}")
-        if not lines:
-            lines.append("No V4L2 devices listed.")
-        return {
-            "video_nodes": video_nodes,
-            "media_nodes": media_nodes,
-            "sysfs_nodes": sysfs_nodes,
-            "userspace_lines": lines,
-        }
+        return self.capture.v4l2_inventory()
 
     def _capture_log_hints(self) -> list[str]:
-        result = run_command(
-            [
-                "journalctl",
-                "-b",
-                f"--grep={CAPTURE_LOG_PATTERN}",
-                "-n",
-                "10",
-                "--no-pager",
-                "-o",
-                "short-iso",
-            ],
-            timeout=5.0,
-        )
-        return parse_journal_lines(result, limit=6)
+        return self.capture.capture_log_hints()
 
     @staticmethod
     def _capture_log_issues(entries: Sequence[str]) -> list[str]:
-        issue_keywords = (
-            "error",
-            "fail",
-            "failed",
-            "warn",
-            "timeout",
-            "reset",
-            "disconnect",
-            "missing",
-            "invalid",
-            "no signal",
-        )
-        issues = [entry for entry in entries if any(token in entry.lower() for token in issue_keywords)]
-        return issues[:3]
+        return CaptureCollector.capture_log_issues(entries)
 
     @staticmethod
     def _connected_drm_connectors(connectors: Sequence[str]) -> list[str]:
-        connected = []
-        for item in connectors:
-            lowered = item.lower()
-            if "connected" in lowered and "disconnected" not in lowered:
-                connected.append(item.split()[0])
-        return connected
+        return CaptureCollector.connected_drm_connectors(connectors)
 
     def _encoder_availability(self) -> list[str]:
-        result = run_command(["ffmpeg", "-hide_banner", "-encoders"], timeout=6.0)
-        encoders = []
-        for raw in result.stdout.splitlines():
-            lower = raw.lower()
-            if any(keyword in lower for keyword in ENCODER_KEYWORDS):
-                encoders.append(" ".join(raw.split()))
-        if encoders:
-            return encoders[:8]
-        if result.missing:
-            return ["ffmpeg not found."]
-        return ["No known hardware encoders detected in ffmpeg output."]
+        return self.capture.encoder_availability()
 
     @staticmethod
     def _encoder_summary(encoders: Sequence[str]) -> str:
-        if not encoders:
-            return "none detected"
-        if len(encoders) == 1 and (
-            encoders[0].endswith("not found.") or encoders[0].startswith("No known hardware encoders")
-        ):
-            return encoders[0]
-        families = []
-        for needle, label in (
-            ("nvenc", "NVENC"),
-            ("qsv", "QSV"),
-            ("amf", "AMF"),
-            ("vaapi", "VAAPI"),
-            ("v4l2m2m", "V4L2-M2M"),
-            ("rkmpp", "RKMPP"),
-        ):
-            if any(needle in item.lower() for item in encoders):
-                families.append(label)
-        if families:
-            return ", ".join(families)
-        return shorten(", ".join(encoders[:3]), 120)
+        return CaptureCollector.encoder_summary(encoders)
 
     @staticmethod
     def _capture_clients(nodes: Sequence[str]) -> dict[str, list[str]]:
-        active_nodes = [node for node in nodes if Path(node).exists()]
-        if not active_nodes:
-            return {}
-        owners: dict[str, set[str]] = {node: set() for node in active_nodes}
-        target_nodes = set(active_nodes)
-        proc_root = Path("/proc")
-        for pid_dir in proc_root.iterdir():
-            if not pid_dir.name.isdigit():
-                continue
-            fd_dir = pid_dir / "fd"
-            if not fd_dir.is_dir():
-                continue
-            comm = read_text(pid_dir / "comm").strip() or pid_dir.name
-            matched: set[str] = set()
-            try:
-                for fd_path in fd_dir.iterdir():
-                    try:
-                        target = os.readlink(fd_path)
-                    except OSError:
-                        continue
-                    if target in target_nodes:
-                        matched.add(target)
-            except OSError:
-                continue
-            for node in matched:
-                owners[node].add(f"{pid_dir.name} {comm}")
-        return {
-            node: sorted(values)
-            for node, values in owners.items()
-            if values
-        }
+        return CaptureCollector.capture_clients(nodes)
 
     def collect_device_specific(self) -> list[str]:
-        lines = ["Capture pipeline:"]
-        cards = self.cached("capture_cards", 30.0, self._capture_cards)
-        modules = self.cached("capture_modules", 10.0, self._capture_modules)
-        driver_params = self.cached("capture_driver_params", 30.0, self._capture_driver_params)
-        v4l2_inventory = self.cached("v4l2_inventory", 20.0, self._v4l2_inventory)
-        encoders = self.cached("encoder_availability", 600.0, self._encoder_availability)
-        connectors = self._drm_connectors()
-        log_hints = self._capture_log_hints()
-        avmatrix_cards = [card for card in cards if "avmatrix" in card.lower()]
-        capture_slots = self._capture_slots(avmatrix_cards)
-        sysfs_nodes = v4l2_inventory.get("sysfs_nodes", []) if isinstance(v4l2_inventory, dict) else []
-        capture_sysfs_nodes = [
-            entry
-            for entry in sysfs_nodes
-            if isinstance(entry, dict) and str(entry.get("slot", "")) in capture_slots
-        ]
-        capture_video_nodes = [
-            str(entry.get("devname"))
-            for entry in capture_sysfs_nodes
-            if entry.get("present") and entry.get("devname")
-        ]
-        media_nodes = v4l2_inventory.get("media_nodes", []) if isinstance(v4l2_inventory, dict) else []
-        userspace_lines = v4l2_inventory.get("userspace_lines", []) if isinstance(v4l2_inventory, dict) else []
-        capture_clients = (
-            self.cached(
-                "capture_clients:" + ",".join(capture_video_nodes),
-                10.0,
-                lambda: self._capture_clients(capture_video_nodes),
-            )
-            if capture_video_nodes
-            else {}
-        )
-        driver_overrides = self._capture_driver_overrides(driver_params)
-        connected_links = self._connected_drm_connectors(connectors)
-        capture_log_issues = self._capture_log_issues(log_hints)
-
-        health = "not detected"
-        if avmatrix_cards:
-            if not capture_sysfs_nodes:
-                health = "broken"
-            elif not capture_video_nodes:
-                health = "degraded"
-            elif len(capture_video_nodes) < len(capture_sysfs_nodes):
-                health = "degraded"
-            else:
-                health = "ready"
-
-        if health == "broken":
-            lines.append("! AVMatrix readiness: broken")
-        elif health == "degraded":
-            lines.append("! AVMatrix readiness: degraded")
-        elif health == "ready":
-            lines.append("AVMatrix readiness: ready")
-        else:
-            lines.append("AVMatrix readiness: not detected")
-
-        if avmatrix_cards:
-            lines.append(f"  Card: {self._capture_card_brief(avmatrix_cards[0])}")
-        lines.append(
-            "  Stages: "
-            + f"card {len(avmatrix_cards)} | kernel {len(capture_sysfs_nodes)}"
-            + f" | /dev/video {len(capture_video_nodes)} | /dev/media {len(media_nodes)}"
-        )
-        lines.append("  Modules: " + (", ".join(modules[:6]) if modules else "none loaded"))
-
-        if avmatrix_cards and not capture_sysfs_nodes:
-            lines.append("! Breakpoint: AVMatrix is on PCI, but no kernel video channels were registered")
-        elif avmatrix_cards and capture_sysfs_nodes and not capture_video_nodes:
-            lines.append("! Breakpoint: kernel channels exist, but /dev/video nodes were not created")
-            lines.append("? Likely udev/device-node issue; userspace cannot open the capture card")
-        elif avmatrix_cards and len(capture_video_nodes) < len(capture_sysfs_nodes):
-            lines.append(f"? Breakpoint: only {len(capture_video_nodes)}/{len(capture_sysfs_nodes)} capture nodes reached userspace")
-        elif modules and not capture_sysfs_nodes:
-            lines.append("? Breakpoint: capture modules are loaded, but the card is not exposing video channels")
-
-        if driver_overrides:
-            lines.append("  Driver overrides: " + ", ".join(driver_overrides[:4]))
-
-        if capture_sysfs_nodes and health != "ready":
-            lines.append("  Channels:")
-            for entry in capture_sysfs_nodes[:8]:
-                lines.append(f"    {self._format_sysfs_v4l2_node(entry)}")
-        elif capture_sysfs_nodes:
-            channel_names = [str(entry.get("label", entry.get("sysfs_name", "video"))) for entry in capture_sysfs_nodes]
-            lines.append("  Channels: " + ", ".join(channel_names[:6]))
-
-        if capture_video_nodes:
-            rw_access = sum(1 for node in capture_video_nodes if os.access(node, os.R_OK | os.W_OK))
-            lines.append(f"  Node access: {rw_access}/{len(capture_video_nodes)} read-write")
-            if isinstance(capture_clients, dict) and capture_clients:
-                client_parts = []
-                for node, owners in list(capture_clients.items())[:4]:
-                    client_parts.append(f"{Path(node).name} -> {', '.join(owners[:2])}")
-                lines.append("  Capture clients: " + "; ".join(client_parts))
-            else:
-                lines.append("  Capture clients: none")
-        elif userspace_lines and health == "not detected":
-            lines.append("  V4L2 view: " + shorten(userspace_lines[0], 140))
-
-        lines.append("Display / encode:")
-        if connected_links:
-            lines.append(f"  Connected links: {', '.join(connected_links[:4])}")
-        else:
-            lines.append("  Connected links: none")
-        lines.append("  Encoders: " + self._encoder_summary(encoders))
-
-        lines.append("Capture log issues:")
-        if capture_log_issues:
-            for item in capture_log_issues[:3]:
-                lines.append(f"  {item}")
-        elif log_hints:
-            lines.append("  No AVMatrix warnings in current boot journal.")
-        else:
-            lines.append("  No AVMatrix journal entries found this boot.")
-        return lines
+        return self.capture.collect()
 
     def _interface_summary(self) -> list[str]:
-        result = run_command(["ip", "-brief", "address"], timeout=3.0)
-        if result.stdout:
-            return line_list(result.stdout, limit=8)
-        if result.missing:
-            return ["ip not found."]
-        return [shorten(single_line(result.stderr), 140) or "No interfaces available."]
+        return self.network.interface_summary()
 
     def _default_route(self) -> str:
-        result = run_command(["ip", "route", "show", "default"], timeout=3.0)
-        if result.stdout:
-            return result.stdout.splitlines()[0]
-        if result.missing:
-            return "ip not found"
-        if result.stderr:
-            return shorten(single_line(result.stderr), 140)
-        return "no default route"
+        return self.network.default_route()
 
     def _dns_servers(self) -> str:
-        resolvectl = run_command(["resolvectl", "dns"], timeout=3.0)
-        if resolvectl.stdout:
-            servers = []
-            for raw in resolvectl.stdout.splitlines():
-                parts = raw.split(":", 1)
-                if len(parts) == 2:
-                    servers.append(parts[1].strip())
-            if servers:
-                return " | ".join(servers[:4])
-        nameservers = []
-        for raw in read_lines(Path("/etc/resolv.conf")):
-            if raw.startswith("nameserver "):
-                nameservers.append(raw.split(None, 1)[1])
-        if nameservers:
-            return ", ".join(nameservers)
-        return "no nameservers found"
+        return self.network.dns_servers()
 
     def _dns_check(self) -> str:
-        result = run_command(["getent", "ahosts", self.dns_probe_host], timeout=3.0)
-        if result.stdout:
-            return result.stdout.splitlines()[0].split()[0]
-        if result.stderr:
-            return shorten(single_line(result.stderr), 120)
-        return "resolution failed"
+        return self.network.dns_check()
 
     def _socket_counts(self) -> tuple[int | None, int | None]:
-        established = run_command(["ss", "-tun", "state", "established", "-H"], timeout=3.0)
-        listening = run_command(["ss", "-ltnu", "-H"], timeout=3.0)
-        established_count = None if established.stderr and not established.stdout else len(line_list(established.stdout))
-        listening_count = None if listening.stderr and not listening.stdout else len(line_list(listening.stdout))
-        return established_count, listening_count
+        return self.network.socket_counts()
 
     def _wireless_interfaces(self) -> list[str]:
-        root = Path("/sys/class/net")
-        if not root.exists():
-            return []
-        names = []
-        for path in sorted(root.iterdir()):
-            if (path / "wireless").exists() or (path / "phy80211").exists():
-                names.append(path.name)
-        return names
+        return self.wifi.wireless_interfaces()
 
     def _proc_net_wireless(self) -> dict[str, dict[str, object]]:
-        return parse_proc_net_wireless_text(read_text(Path("/proc/net/wireless")))
+        return self.wifi.proc_net_wireless()
 
     def _wireless_logs(self) -> list[str]:
-        result = run_command(
-            [
-                "journalctl",
-                "-b",
-                f"--grep={WIFI_LOG_PATTERN}",
-                "-n",
-                "10",
-                "--no-pager",
-                "-o",
-                "short-iso",
-            ],
-            timeout=5.0,
-        )
-        return parse_journal_lines(result, limit=6)
+        return self.wifi.wireless_logs()
 
     def _unit_status(self, action: str, unit: str) -> str:
-        result = run_command(["systemctl", action, unit], timeout=3.0)
-        if result.stdout:
-            return first_nonempty_line(result.stdout)
-        if result.missing:
-            return "systemctl not found"
-        if result.timed_out:
-            return "systemctl timed out"
-        if result.stderr:
-            lowered = result.stderr.lower()
-            if "failed to connect to system scope bus" in lowered or "operation not permitted" in lowered:
-                return "system bus unavailable"
-            return shorten(single_line(first_nonempty_line(result.stderr)), 120)
-        return "unknown"
+        return self.bluetooth.unit_status(action, unit)
 
     def _rfkill_radios_from_sysfs(self, allowed_types: Sequence[str]) -> list[dict[str, object]]:
-        type_filters = {entry.strip().lower() for entry in allowed_types}
-        root = Path("/sys/class/rfkill")
-        if not root.exists():
-            return []
-        radios: list[dict[str, object]] = []
-        for path in sorted(root.iterdir()):
-            radio_type = read_text(path / "type").strip().lower()
-            if radio_type not in type_filters:
-                continue
-            radios.append(
-                {
-                    "name": read_text(path / "name").strip() or path.name,
-                    "type": radio_type,
-                    "soft_blocked": read_text(path / "soft").strip() == "1",
-                    "hard_blocked": read_text(path / "hard").strip() == "1",
-                }
-            )
-        return radios
+        return self.bluetooth.rfkill_radios_from_sysfs(allowed_types)
 
     def _bluetooth_adapters(self) -> list[str]:
-        root = Path("/sys/class/bluetooth")
-        if not root.exists():
-            return []
-        return sorted(path.name for path in root.iterdir())
+        return self.bluetooth.bluetooth_adapters()
 
     def _bluetooth_logs(self) -> list[str]:
-        result = run_command(
-            [
-                "journalctl",
-                "-b",
-                f"--grep={BLUETOOTH_LOG_PATTERN}",
-                "-n",
-                "12",
-                "--no-pager",
-                "-o",
-                "short-iso",
-            ],
-            timeout=5.0,
-        )
-        return parse_journal_lines(result, limit=8)
+        return self.bluetooth.bluetooth_logs()
 
     def _bluetoothctl_text(self, args: Sequence[str], timeout: float = 4.0) -> tuple[str, str | None]:
-        result = run_command(["bluetoothctl", *args], timeout=timeout)
-        if result.stdout:
-            return result.stdout, None
-        if result.missing:
-            return "", "bluetoothctl not found"
-        if result.timed_out:
-            return "", "bluetoothctl timed out"
-        if result.stderr:
-            lowered = result.stderr.lower()
-            if "dbus_connection_get_object_path_data" in lowered or "connection != null" in lowered:
-                return "", "bluetoothctl failed to connect to D-Bus"
-            return "", shorten(single_line(first_nonempty_line(result.stderr)), 120)
-        return "", f"bluetoothctl exited {result.returncode}"
+        return self.bluetooth.bluetoothctl_text(args, timeout=timeout)
 
     @staticmethod
     def _bluetooth_device_sort_key(entry: dict[str, object]) -> tuple[int, int, int, str]:
-        connected = 0 if entry.get("connected") else 1
-        trusted = 0 if entry.get("trusted") else 1
-        paired = 0 if entry.get("paired") else 1
-        name = str(entry.get("alias") or entry.get("name") or entry.get("address") or "")
-        return (connected, trusted, paired, name.lower())
+        return BluetoothCollector.bluetooth_device_sort_key(entry)
 
     @staticmethod
     def _bluetooth_issue_logs(entries: Sequence[str]) -> list[str]:
-        issue_keywords = (
-            "error",
-            "fail",
-            "failed",
-            "timeout",
-            "disconnect",
-            "denied",
-            "blocked",
-            "abort",
-            "missing",
-        )
-        return [entry for entry in entries if any(token in entry.lower() for token in issue_keywords)][:4]
+        return BluetoothCollector.bluetooth_issue_logs(entries)
 
     def _live_bluetooth_state(self) -> dict[str, object]:
-        service_active = self._unit_status("is-active", "bluetooth.service")
-        service_enabled = self._unit_status("is-enabled", "bluetooth.service")
-        adapters = self._bluetooth_adapters()
-        rfkill = self._rfkill_radios_from_sysfs(("bluetooth",))
-        if not rfkill:
-            rfkill_result = run_command(["rfkill", "list"], timeout=3.0)
-            rfkill = parse_rfkill_output(rfkill_result.stdout, allowed_types=("bluetooth",)) if rfkill_result.stdout else []
-
-        controller: dict[str, object] = {}
-        devices: list[dict[str, object]] = []
-        notes: list[str] = []
-        should_query_bluetoothctl = bool(adapters) or service_active in {"active", "activating"}
-        if should_query_bluetoothctl:
-            show_text, show_error = self._bluetoothctl_text(["show"], timeout=4.0)
-            if show_text and "No default controller available" not in show_text:
-                controller = parse_bluetoothctl_show(show_text)
-            elif show_error:
-                notes.append(show_error)
-
-            paired_text, paired_error = self._bluetoothctl_text(["paired-devices"], timeout=4.0)
-            connected_text, connected_error = self._bluetoothctl_text(["devices", "Connected"], timeout=4.0)
-
-            known_devices: dict[str, dict[str, object]] = {}
-            if paired_text:
-                for entry in parse_bluetoothctl_devices(paired_text):
-                    address = str(entry.get("address", "")).upper()
-                    if not address:
-                        continue
-                    known_devices[address] = {**entry, "paired": True}
-            if connected_text:
-                for entry in parse_bluetoothctl_devices(connected_text):
-                    address = str(entry.get("address", "")).upper()
-                    if not address:
-                        continue
-                    known = known_devices.setdefault(address, dict(entry))
-                    known.update(entry)
-                    known["connected"] = True
-            for error in (paired_error, connected_error):
-                if error and error not in notes:
-                    notes.append(error)
-
-            for address in list(known_devices)[:10]:
-                info_text, info_error = self._bluetoothctl_text(["info", address], timeout=4.0)
-                if info_text:
-                    known_devices[address].update(parse_bluetoothctl_info(info_text))
-                elif info_error and info_error not in notes:
-                    notes.append(info_error)
-            devices = sorted(known_devices.values(), key=self._bluetooth_device_sort_key)
-
-        logs = self.cached("bluetooth_logs", 60.0, self._bluetooth_logs)
-        return {
-            "service_active": service_active,
-            "service_enabled": service_enabled,
-            "adapters": adapters,
-            "rfkill": rfkill,
-            "controller": controller,
-            "devices": devices,
-            "logs": logs,
-            "notes": notes,
-        }
+        return self.bluetooth.live_state()
 
     def _bluetooth_state(self) -> dict[str, object]:
-        live = self.cached("bluetooth_live_state", 15.0, self._live_bluetooth_state)
-        if isinstance(live, dict):
-            return live
-        return {}
+        return self.bluetooth.state()
 
     def _live_wifi_state(self) -> dict[str, object]:
-        quality = self.cached("proc_net_wireless", 5.0, self._proc_net_wireless)
-        interfaces: list[dict[str, object]] = []
-        for name in self._wireless_interfaces():
-            sysfs = Path("/sys/class/net") / name
-            entry: dict[str, object] = {
-                "interface": name,
-                "operstate": read_text(sysfs / "operstate").strip() or "unknown",
-                "mac": read_text(sysfs / "address").strip() or "",
-                "carrier": read_text(sysfs / "carrier").strip() == "1",
-                "mtu": parse_int(read_text(sysfs / "mtu"), default=0),
-            }
-            try:
-                entry["driver"] = (sysfs / "device" / "driver").resolve().name
-            except OSError:
-                pass
-
-            info_result = run_command(["iw", "dev", name, "info"], timeout=3.0)
-            if info_result.stdout:
-                for raw in info_result.stdout.splitlines():
-                    line = raw.strip()
-                    if line.startswith("type "):
-                        entry["type"] = line.split(None, 1)[1].strip()
-                    elif line.startswith("channel "):
-                        entry.update(parse_iw_channel_details(line))
-                    elif line.startswith("txpower "):
-                        number = parse_float(line)
-                        if number is not None:
-                            entry["tx_power_dbm"] = number
-
-            link_result = run_command(["iw", "dev", name, "link"], timeout=3.0)
-            if link_result.stdout:
-                entry.update(parse_iw_link_output(link_result.stdout))
-
-            station_result = run_command(["iw", "dev", name, "station", "dump"], timeout=4.0)
-            if station_result.stdout:
-                entry.update(parse_iw_station_dump(station_result.stdout))
-
-            power_save_result = run_command(["iw", "dev", name, "get", "power_save"], timeout=3.0)
-            if power_save_result.stdout:
-                for raw in power_save_result.stdout.splitlines():
-                    line = raw.strip()
-                    if line.lower().startswith("power save:"):
-                        entry["power_save"] = line.split(":", 1)[1].strip().lower()
-                        break
-
-            if isinstance(quality, dict) and name in quality:
-                entry.update(quality[name])
-            interfaces.append(entry)
-
-        rfkill_result = run_command(["rfkill", "list"], timeout=3.0)
-        radios = parse_rfkill_output(rfkill_result.stdout) if rfkill_result.stdout else []
-        logs = self.cached("wifi_logs", 60.0, self._wireless_logs)
-        return {
-            "interfaces": interfaces,
-            "rfkill": radios,
-            "logs": logs,
-        }
+        return self.wifi.live_state()
 
     def _wifi_state(self) -> dict[str, object]:
-        privileged = self._privileged_section("wifi")
-        if privileged:
-            return privileged
-        live = self.cached("wifi_live_state", 10.0, self._live_wifi_state)
-        if isinstance(live, dict):
-            return live
-        return {}
+        return self.wifi.state()
 
     @staticmethod
     def _wifi_interface_sort_key(entry: dict[str, object]) -> tuple[int, int, str]:
-        connected = 0 if entry.get("connected") else 1
-        carrier = 0 if entry.get("carrier") else 1
-        return (connected, carrier, str(entry.get("interface", "")))
+        return WifiCollector.interface_sort_key(entry)
 
     @staticmethod
     def _wifi_signal_label(signal_dbm: float | int | None) -> str:
-        if not isinstance(signal_dbm, (int, float)):
-            return "unknown signal"
-        if signal_dbm >= -60:
-            return "excellent signal"
-        if signal_dbm >= -67:
-            return "good signal"
-        if signal_dbm >= -75:
-            return "fair signal"
-        return "weak signal"
+        return WifiCollector.signal_label(signal_dbm)
 
     @staticmethod
     def _wifi_issue_logs(entries: Sequence[str]) -> list[str]:
-        issue_keywords = (
-            "error",
-            "fail",
-            "failed",
-            "warn",
-            "timeout",
-            "disconnect",
-            "roam",
-            "deauth",
-            "auth",
-            "blocked",
-        )
-        issues = [entry for entry in entries if any(token in entry.lower() for token in issue_keywords)]
-        return issues[:3]
+        return WifiCollector.issue_logs(entries)
 
     def _wifi_summary_line(self, entry: dict[str, object]) -> str:
-        iface = str(entry.get("interface", "wifi"))
-        driver = str(entry.get("driver", "")).strip()
-        operstate = str(entry.get("operstate", "unknown"))
-        carrier = "carrier" if entry.get("carrier") else "no-carrier"
-        mode = str(entry.get("type", "")).strip()
-        parts = [f"{iface} {operstate}", carrier]
-        if driver:
-            parts.append(driver)
-        if mode:
-            parts.append(mode)
-        return " | ".join(parts)
+        return self.wifi.summary_line(entry)
 
     def _wifi_link_line(self, entry: dict[str, object]) -> str:
-        if not entry.get("connected"):
-            return "Link: not associated"
-        ssid = str(entry.get("ssid", "")).strip() or "hidden SSID"
-        bssid = str(entry.get("bssid", "")).strip()
-        band = str(entry.get("band", "")).strip()
-        channel = entry.get("channel")
-        frequency = entry.get("frequency_mhz")
-        width = entry.get("width_mhz")
-        parts = [ssid]
-        if bssid:
-            parts.append(bssid)
-        if band:
-            parts.append(band)
-        if isinstance(channel, int) and channel > 0:
-            parts.append(f"ch {channel}")
-        if isinstance(width, int) and width > 0:
-            parts.append(f"{width} MHz")
-        elif isinstance(frequency, int) and frequency > 0:
-            parts.append(f"{frequency} MHz")
-        return "Link: " + " | ".join(parts)
+        return self.wifi.link_line(entry)
 
     def _wifi_signal_line(self, entry: dict[str, object]) -> str:
-        signal = entry.get("signal_dbm")
-        noise = entry.get("noise_dbm")
-        quality = entry.get("quality_pct")
-        tx_power = entry.get("tx_power_dbm")
-        parts = []
-        if isinstance(signal, (int, float)):
-            parts.append(f"{signal:.0f} dBm")
-            parts.append(self._wifi_signal_label(signal))
-        if isinstance(quality, (int, float)):
-            parts.append(f"{quality:.0f}% quality")
-        if isinstance(noise, (int, float)):
-            parts.append(f"noise {noise:.0f} dBm")
-        if isinstance(tx_power, (int, float)):
-            parts.append(f"txpower {tx_power:.1f} dBm")
-        return "Signal: " + (" | ".join(parts) if parts else "unavailable")
+        return self.wifi.signal_line(entry)
 
     @staticmethod
     def _wifi_phy_line(entry: dict[str, object]) -> str:
-        rx = entry.get("rx_bitrate_mbps")
-        tx = entry.get("tx_bitrate_mbps")
-        expected = entry.get("expected_throughput_mbps")
-        power_save = str(entry.get("power_save", "")).strip()
-        parts = []
-        if isinstance(rx, (int, float)):
-            parts.append(f"rx {rx:.1f} Mb/s")
-        if isinstance(tx, (int, float)):
-            parts.append(f"tx {tx:.1f} Mb/s")
-        if isinstance(expected, (int, float)):
-            parts.append(f"expected {expected:.1f} Mb/s")
-        if power_save:
-            parts.append(f"power save {power_save}")
-        return "PHY: " + (" | ".join(parts) if parts else "unavailable")
+        return WifiCollector.phy_line(entry)
 
     @staticmethod
     def _wifi_traffic_line(entry: dict[str, object]) -> str:
-        rx_bytes = entry.get("rx_bytes")
-        tx_bytes = entry.get("tx_bytes")
-        rx_packets = entry.get("rx_packets")
-        tx_packets = entry.get("tx_packets")
-        connected_seconds = entry.get("connected_seconds")
-        parts = []
-        if isinstance(rx_bytes, int) and rx_bytes >= 0:
-            rx_label = format_bytes(rx_bytes)
-            if isinstance(rx_packets, int):
-                rx_label += f" / {rx_packets} pkts"
-            parts.append(f"rx {rx_label}")
-        if isinstance(tx_bytes, int) and tx_bytes >= 0:
-            tx_label = format_bytes(tx_bytes)
-            if isinstance(tx_packets, int):
-                tx_label += f" / {tx_packets} pkts"
-            parts.append(f"tx {tx_label}")
-        if isinstance(connected_seconds, int) and connected_seconds >= 0:
-            parts.append(f"connected {format_duration_compact(connected_seconds)}")
-        return "Traffic: " + (" | ".join(parts) if parts else "unavailable")
+        return WifiCollector.traffic_line(entry)
 
     @staticmethod
     def _wifi_reliability_line(entry: dict[str, object]) -> str:
-        inactive_ms = entry.get("inactive_ms")
-        retries = entry.get("tx_retries")
-        failed = entry.get("tx_failed")
-        beacon_loss = entry.get("beacon_loss")
-        discard_retry = entry.get("discard_retry")
-        missed_beacon = entry.get("missed_beacon")
-        authorized = entry.get("authorized")
-        authenticated = entry.get("authenticated")
-        associated = entry.get("associated")
-        parts = []
-        if isinstance(inactive_ms, int):
-            parts.append(f"idle {inactive_ms} ms")
-        if isinstance(retries, int):
-            parts.append(f"retries {retries}")
-        if isinstance(failed, int):
-            parts.append(f"failed {failed}")
-        if isinstance(beacon_loss, int):
-            parts.append(f"beacon loss {beacon_loss}")
-        if isinstance(discard_retry, int) and discard_retry > 0:
-            parts.append(f"driver retry discards {discard_retry}")
-        if isinstance(missed_beacon, int) and missed_beacon > 0:
-            parts.append(f"missed beacon {missed_beacon}")
-        auth_states = []
-        if isinstance(authorized, bool):
-            auth_states.append("authorized" if authorized else "not authorized")
-        if isinstance(authenticated, bool):
-            auth_states.append("authenticated" if authenticated else "not authenticated")
-        if isinstance(associated, bool):
-            auth_states.append("associated" if associated else "not associated")
-        if auth_states:
-            parts.append(", ".join(auth_states))
-        return "Reliability: " + (" | ".join(parts) if parts else "no station metrics")
+        return WifiCollector.reliability_line(entry)
 
     def _wifi_assessment_line(self, entry: dict[str, object]) -> str:
-        if not entry.get("connected"):
-            operstate = str(entry.get("operstate", "unknown"))
-            return f"Assessment: disconnected | operstate {operstate}"
-        signal = entry.get("signal_dbm")
-        band = str(entry.get("band", "")).strip()
-        expected = entry.get("expected_throughput_mbps")
-        power_save = str(entry.get("power_save", "")).strip()
-        retries = entry.get("tx_retries")
-        failed = entry.get("tx_failed")
-        beacon_loss = entry.get("beacon_loss")
-        parts = []
-        parts.append(self._wifi_signal_label(signal if isinstance(signal, (int, float)) else None))
-        if band:
-            parts.append(f"{band} link")
-        if isinstance(expected, (int, float)):
-            if expected >= 400:
-                parts.append("high expected throughput")
-            elif expected >= 100:
-                parts.append("moderate expected throughput")
-            else:
-                parts.append("low expected throughput")
-        if isinstance(beacon_loss, int) and beacon_loss > 0:
-            parts.append("beacon loss observed")
-        elif isinstance(failed, int) and failed > 0:
-            parts.append("tx failures observed")
-        elif isinstance(retries, int) and retries > 200:
-            parts.append("retry-heavy link")
-        else:
-            parts.append("no obvious retry pressure")
-        if power_save == "on":
-            parts.append("power save enabled")
-        return "Assessment: " + " | ".join(parts)
+        return self.wifi.assessment_line(entry)
 
     def _wifi_digest(self) -> dict[str, object]:
-        state = self._wifi_state()
-        interfaces = state.get("interfaces", [])
-        radios = state.get("rfkill", [])
-        digest: dict[str, object] = {
-            "present": False,
-            "blocked": False,
-            "connected": False,
-        }
-        if isinstance(radios, list):
-            for radio in radios:
-                if not isinstance(radio, dict):
-                    continue
-                if radio.get("soft_blocked") or radio.get("hard_blocked"):
-                    digest["blocked"] = True
-                    break
-        if not isinstance(interfaces, list) or not interfaces:
-            return digest
-        parsed_interfaces = [entry for entry in interfaces if isinstance(entry, dict)]
-        if not parsed_interfaces:
-            return digest
-        parsed_interfaces.sort(key=self._wifi_interface_sort_key)
-        active = parsed_interfaces[0]
-        digest["present"] = True
-        digest["interface"] = str(active.get("interface", ""))
-        digest["connected"] = bool(active.get("connected"))
-        if active.get("connected"):
-            digest["ssid"] = str(active.get("ssid", ""))
-        signal = active.get("signal_dbm")
-        if isinstance(signal, (int, float)):
-            digest["signal_dbm"] = float(signal)
-        retries = active.get("tx_retries")
-        failed = active.get("tx_failed")
-        beacon_loss = active.get("beacon_loss")
-        if isinstance(retries, int):
-            digest["tx_retries"] = retries
-        if isinstance(failed, int):
-            digest["tx_failed"] = failed
-        if isinstance(beacon_loss, int):
-            digest["beacon_loss"] = beacon_loss
-        return digest
+        return self.wifi.digest()
 
     @staticmethod
     def _bluetooth_device_line(entry: dict[str, object]) -> str:
-        name = str(entry.get("alias") or entry.get("name") or entry.get("address") or "device").strip()
-        address = str(entry.get("address", "")).strip()
-        icon = str(entry.get("icon", "")).strip()
-        parts = [name]
-        if address and address != name:
-            parts.append(address)
-        if icon:
-            parts.append(icon)
-        flags = []
-        if entry.get("connected"):
-            flags.append("connected")
-        if entry.get("trusted"):
-            flags.append("trusted")
-        if entry.get("paired"):
-            flags.append("paired")
-        if entry.get("blocked"):
-            flags.append("blocked")
-        battery = entry.get("battery_pct")
-        rssi = entry.get("rssi_dbm")
-        tx_power = entry.get("tx_power_dbm")
-        if isinstance(battery, int) and battery >= 0:
-            parts.append(f"battery {battery}%")
-        if isinstance(rssi, (int, float)):
-            parts.append(f"RSSI {rssi:.0f} dBm")
-        if isinstance(tx_power, (int, float)):
-            parts.append(f"tx {tx_power:.0f} dBm")
-        if flags:
-            parts.append("/".join(flags))
-        return " | ".join(parts)
+        return BluetoothCollector.bluetooth_device_line(entry)
 
     def _bluetooth_digest(self) -> dict[str, object]:
-        state = self._bluetooth_state()
-        adapters = state.get("adapters", [])
-        rfkill = state.get("rfkill", [])
-        controller = state.get("controller", {})
-        devices = state.get("devices", [])
-        logs = state.get("logs", [])
-        digest: dict[str, object] = {
-            "adapter_count": len(adapters) if isinstance(adapters, list) else 0,
-            "blocked": False,
-            "connected_count": 0,
-            "paired_count": 0,
-            "trusted_count": 0,
-            "service_active": str(state.get("service_active", "unknown")),
-        }
-        if isinstance(rfkill, list):
-            for radio in rfkill:
-                if not isinstance(radio, dict):
-                    continue
-                if radio.get("soft_blocked") or radio.get("hard_blocked"):
-                    digest["blocked"] = True
-                    break
-        if isinstance(controller, dict) and controller:
-            powered = controller.get("powered")
-            if isinstance(powered, bool):
-                digest["powered"] = powered
-            discovering = controller.get("discovering")
-            if isinstance(discovering, bool):
-                digest["discovering"] = discovering
-        if isinstance(devices, list):
-            parsed_devices = [entry for entry in devices if isinstance(entry, dict)]
-            digest["connected_count"] = sum(1 for entry in parsed_devices if entry.get("connected"))
-            digest["paired_count"] = sum(1 for entry in parsed_devices if entry.get("paired"))
-            digest["trusted_count"] = sum(1 for entry in parsed_devices if entry.get("trusted"))
-        if isinstance(logs, list):
-            digest["issue_count"] = len(self._bluetooth_issue_logs(logs))
-        return digest
+        return self.bluetooth.digest()
 
     def collect_bluetooth(self) -> list[str]:
-        state = self._bluetooth_state()
-        adapters = state.get("adapters", [])
-        rfkill = state.get("rfkill", [])
-        controller = state.get("controller", {})
-        devices = state.get("devices", [])
-        logs = state.get("logs", [])
-        notes = state.get("notes", [])
-        service_active = str(state.get("service_active", "unknown"))
-        service_enabled = str(state.get("service_enabled", "unknown"))
-
-        lines: list[str] = [f"Service: {service_active} | {service_enabled}"]
-
-        if isinstance(adapters, list) and adapters:
-            lines.append(f"Adapters: {len(adapters)} detected ({', '.join(adapters[:4])})")
-        else:
-            lines.append("Adapters: none detected")
-
-        if isinstance(rfkill, list) and rfkill:
-            radio_parts = []
-            for radio in rfkill[:4]:
-                if not isinstance(radio, dict):
-                    continue
-                name = str(radio.get("name", "bluetooth"))
-                status = "hard-blocked" if radio.get("hard_blocked") else "soft-blocked" if radio.get("soft_blocked") else "unblocked"
-                radio_parts.append(f"{name} {status}")
-            if radio_parts:
-                lines.append("RFKill: " + " | ".join(radio_parts))
-
-        if isinstance(controller, dict) and controller:
-            parts = []
-            name = str(controller.get("alias") or controller.get("name") or controller.get("address") or "controller").strip()
-            address = str(controller.get("address", "")).strip()
-            parts.append(name)
-            if address and address != name:
-                parts.append(address)
-            powered = controller.get("powered")
-            discoverable = controller.get("discoverable")
-            pairable = controller.get("pairable")
-            discovering = controller.get("discovering")
-            if isinstance(powered, bool):
-                parts.append("powered" if powered else "powered off")
-            if isinstance(discoverable, bool):
-                parts.append("discoverable" if discoverable else "non-discoverable")
-            if isinstance(pairable, bool):
-                parts.append("pairable" if pairable else "non-pairable")
-            if isinstance(discovering, bool):
-                parts.append("scanning" if discovering else "idle")
-            lines.append("Controller: " + " | ".join(parts))
-
-        parsed_devices = [entry for entry in devices if isinstance(entry, dict)] if isinstance(devices, list) else []
-        connected_devices = [entry for entry in parsed_devices if entry.get("connected")]
-        trusted_count = sum(1 for entry in parsed_devices if entry.get("trusted"))
-        paired_count = sum(1 for entry in parsed_devices if entry.get("paired"))
-        lines.append(
-            "Devices: "
-            + f"{paired_count} paired | {trusted_count} trusted | {len(connected_devices)} connected"
-        )
-
-        if connected_devices:
-            lines.append("Connected devices:")
-            for entry in connected_devices[:4]:
-                lines.append(f"  {self._bluetooth_device_line(entry)}")
-        elif parsed_devices:
-            lines.append("Known devices:")
-            for entry in parsed_devices[:4]:
-                lines.append(f"  {self._bluetooth_device_line(entry)}")
-        else:
-            lines.append("Devices: no paired or connected devices reported.")
-
-        if isinstance(notes, list) and notes:
-            lines.append("Collector notes:")
-            for note in notes[:3]:
-                lines.append(f"  {note}")
-
-        lines.append("Recent Bluetooth logs:")
-        issues = self._bluetooth_issue_logs(logs) if isinstance(logs, list) else []
-        if issues:
-            for item in issues[:4]:
-                lines.append(f"  {item}")
-        elif isinstance(logs, list) and logs:
-            lines.append("  No obvious Bluetooth warnings in current boot journal.")
-        else:
-            lines.append("  No Bluetooth journal entries found this boot.")
-        return lines
+        return self.bluetooth.collect()
 
     def collect_wifi(self) -> list[str]:
-        state = self._wifi_state()
-        snapshot_line = self._privileged_snapshot_line() if self._privileged_section("wifi") else None
-        interfaces = state.get("interfaces", [])
-        radios = state.get("rfkill", [])
-        logs = state.get("logs", [])
-
-        lines: list[str] = []
-        if snapshot_line:
-            lines.append(snapshot_line)
-
-        if isinstance(radios, list) and radios:
-            radio_parts = []
-            for radio in radios[:4]:
-                if not isinstance(radio, dict):
-                    continue
-                name = str(radio.get("name", "wifi"))
-                status = "hard-blocked" if radio.get("hard_blocked") else "soft-blocked" if radio.get("soft_blocked") else "unblocked"
-                radio_parts.append(f"{name} {status}")
-            if radio_parts:
-                lines.append("RFKill: " + " | ".join(radio_parts))
-
-        parsed_interfaces = [entry for entry in interfaces if isinstance(entry, dict)] if isinstance(interfaces, list) else []
-        if not parsed_interfaces:
-            lines.append("No wireless interfaces detected.")
-            return lines
-
-        parsed_interfaces.sort(key=self._wifi_interface_sort_key)
-        for entry in parsed_interfaces[:2]:
-            lines.append(self._wifi_summary_line(entry))
-            lines.append("  " + self._wifi_link_line(entry))
-            lines.append("  " + self._wifi_signal_line(entry))
-            lines.append("  " + self._wifi_phy_line(entry))
-            lines.append("  " + self._wifi_traffic_line(entry))
-            lines.append("  " + self._wifi_reliability_line(entry))
-            lines.append("  " + self._wifi_assessment_line(entry))
-
-        lines.append("Recent Wi-Fi logs:")
-        issues = self._wifi_issue_logs(logs) if isinstance(logs, list) else []
-        if issues:
-            for item in issues[:3]:
-                lines.append(f"  {item}")
-        elif isinstance(logs, list) and logs:
-            lines.append("  No obvious Wi-Fi warnings in current boot journal.")
-        else:
-            lines.append("  No Wi-Fi journal entries found this boot.")
-        return lines
+        return self.wifi.collect()
 
     def collect_network(self) -> list[str]:
-        privileged = self._privileged_section("network")
-        if privileged:
-            snapshot_line = self._privileged_snapshot_line()
-            interfaces = privileged.get("interfaces", [])
-            default_route = str(privileged.get("default_route", "no default route"))
-            dns_servers = str(privileged.get("dns_servers", "no nameservers found"))
-            dns_check = str(privileged.get("dns_check", "resolution failed"))
-            connections = privileged.get("connections", {})
-            established = None
-            listening = None
-            if isinstance(connections, dict):
-                established = connections.get("established")
-                listening = connections.get("listening")
-            lines = []
-            if snapshot_line:
-                lines.append(snapshot_line)
-            lines.append("Interfaces:")
-            if isinstance(interfaces, list) and interfaces:
-                for item in interfaces[:6]:
-                    lines.append(f"  {item}")
-            else:
-                lines.append("  No interfaces available.")
-            lines.append(f"Default route: {default_route}")
-            lines.append(f"DNS servers: {dns_servers}")
-            lines.append(f"DNS lookup: {self.dns_probe_host} -> {dns_check}")
-            if established is None or listening is None:
-                lines.append("Connections: unavailable (socket inspection failed)")
-            else:
-                lines.append(f"Connections: {established} established | {listening} listening sockets")
-            return lines
-
-        interfaces = self._interface_summary()
-        default_route = self._default_route()
-        dns_servers = self._dns_servers()
-        dns_check = self.cached("dns_check", 60.0, self._dns_check)
-        established, listening = self._socket_counts()
-
-        lines = ["Interfaces:"]
-        for item in interfaces[:6]:
-            lines.append(f"  {item}")
-        lines.append(f"Default route: {default_route}")
-        lines.append(f"DNS servers: {dns_servers}")
-        lines.append(f"DNS lookup: {self.dns_probe_host} -> {dns_check}")
-        if established is None or listening is None:
-            lines.append("Connections: unavailable (socket inspection failed)")
-        else:
-            lines.append(f"Connections: {established} established | {listening} listening sockets")
-        return lines
+        return self.network.collect()
 
     def _listening_sockets(self) -> list[str]:
         rows, error = self._listener_rows()
