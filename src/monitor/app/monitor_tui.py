@@ -322,7 +322,7 @@ class MonitorBackend:
                     problems.append((severity, f"? {pending_total} pending package updates ({aur_pending} AUR)"))
             if isinstance(tracked_outdated, int) and tracked_outdated > 0:
                 severity = 95 if tracked_outdated >= 3 else 70
-                problems.append((severity, f"? {tracked_outdated} tracked kernel/firmware/NVIDIA packages are outdated"))
+                problems.append((severity, f"? {tracked_outdated} tracked priority packages are outdated"))
 
         storage = current.get("storage", {})
         if isinstance(storage, dict):
@@ -532,6 +532,9 @@ class MonitorBackend:
 
     def _tracked_nvidia_packages(self, installed: dict[str, str]) -> list[tuple[str, str]]:
         return self.package_monitor.tracked_nvidia_packages(installed)
+
+    def _tracked_priority_packages(self, installed: dict[str, str]) -> list[tuple[str, str]]:
+        return self.package_monitor.tracked_priority_rows(installed)
 
     @staticmethod
     def _package_line(name: str, installed_version: str, latest_version: str | None) -> str:

@@ -71,11 +71,7 @@ class DiffSnapshotService:
             **package_state["aur_updates"],
             **package_state["official_updates"],
         }
-        tracked_rows = [
-            *self.backend._tracked_kernel_packages(installed),
-            *self.backend._tracked_firmware_versions(installed),
-            *self.backend._tracked_nvidia_packages(installed),
-        ]
+        tracked_rows = self.backend._tracked_priority_packages(installed)
         tracked_outdated = sum(
             1
             for name, version in tracked_rows

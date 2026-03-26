@@ -31,6 +31,77 @@ NVIDIA_PACKAGE_NAMES = (
     "nvidia-utils",
     "lib32-nvidia-utils",
 )
+DESKTOP_SESSION_PACKAGE_NAMES = (
+    "plasma-desktop",
+    "plasma-workspace",
+    "kwin",
+    "sddm",
+    "gdm",
+    "gdm3",
+    "gnome-shell",
+    "mutter",
+    "gnome-session",
+    "sway",
+    "hyprland",
+)
+GRAPHICS_STACK_PACKAGE_NAMES = (
+    "mesa",
+    "lib32-mesa",
+    "xorg-server",
+    "xorg-xwayland",
+    "wayland",
+    "xserver-xorg-core",
+    "xwayland",
+    "mesa-vulkan-drivers",
+    "libgl1-mesa-dri",
+    "vulkan-intel",
+    "lib32-vulkan-intel",
+    "vulkan-radeon",
+    "lib32-vulkan-radeon",
+    "vulkan-nouveau",
+    "lib32-vulkan-nouveau",
+    "intel-media-driver",
+    "libva-intel-driver",
+    "libva-mesa-driver",
+    "mesa-va-drivers",
+    "mesa-vdpau",
+    "lib32-mesa-vdpau",
+    "xf86-video-amdgpu",
+    "xf86-video-ati",
+    "xf86-video-intel",
+    "xf86-video-nouveau",
+    "xserver-xorg-video-amdgpu",
+    "xserver-xorg-video-ati",
+    "xserver-xorg-video-intel",
+    "xserver-xorg-video-nouveau",
+)
+NETWORK_STACK_PACKAGE_NAMES = (
+    "networkmanager",
+    "network-manager",
+    "iwd",
+    "wpa_supplicant",
+    "wpasupplicant",
+    "wireless-regdb",
+    "modemmanager",
+)
+BOOT_CHAIN_PACKAGE_NAMES = (
+    "systemd",
+    "mkinitcpio",
+    "dracut",
+    "initramfs-tools",
+    "grub",
+    "grub-common",
+    "grub-efi-amd64",
+    "grub-pc",
+    "efibootmgr",
+    "shim",
+    "shim-signed",
+    "sbctl",
+)
+EXTERNAL_DRIVER_PACKAGE_NAMES = (
+    "broadcom-wl",
+    "broadcom-sta-dkms",
+)
 
 
 @dataclass
@@ -458,10 +529,100 @@ class PackageMonitor:
         return []
 
     @staticmethod
+    def installed_named(installed: dict[str, str], names: Sequence[str]) -> list[tuple[str, str]]:
+        return [(name, installed[name]) for name in names if name in installed]
+
+    def tracked_desktop_packages(self, installed: dict[str, str]) -> list[tuple[str, str]]:
+        return self.installed_named(installed, DESKTOP_SESSION_PACKAGE_NAMES)
+
+    def tracked_graphics_packages(self, installed: dict[str, str]) -> list[tuple[str, str]]:
+        return self.installed_named(installed, GRAPHICS_STACK_PACKAGE_NAMES)
+
+    def tracked_network_packages(self, installed: dict[str, str]) -> list[tuple[str, str]]:
+        return self.installed_named(installed, NETWORK_STACK_PACKAGE_NAMES)
+
+    def tracked_boot_packages(self, installed: dict[str, str]) -> list[tuple[str, str]]:
+        return self.installed_named(installed, BOOT_CHAIN_PACKAGE_NAMES)
+
+    def tracked_external_driver_packages(self, installed: dict[str, str]) -> list[tuple[str, str]]:
+        rows = self.installed_named(installed, EXTERNAL_DRIVER_PACKAGE_NAMES)
+        for name, version in sorted(installed.items()):
+            if not name.endswith("-dkms"):
+                continue
+            if name in NVIDIA_PACKAGE_NAMES:
+                continue
+            rows.append((name, version))
+        deduped: dict[str, str] = {}
+        for name, version in rows:
+            deduped[name] = version
+        return sorted(deduped.items())
+
+    def tracked_priority_groups(self, installed: dict[str, str]) -> list[tuple[str, list[tuple[str, str]]]]:
+        groups: list[tuple[str, list[tuple[str, str]]]] = [
+            ("Kernel", self.tracked_kernel_packages(installed)),
+            ("Firmware", self.tracked_firmware_versions(installed)),
+        ]
+        nvidia_packages = self.tracked_nvidia_packages(installed)
+        if self.backend.nvidia_monitoring_enabled() or nvidia_packages:
+            groups.append(("NVIDIA", nvidia_packages))
+        optional_groups = [
+            ("Desktop / session", self.tracked_desktop_packages(installed)),
+            ("Graphics stack", self.tracked_graphics_packages(installed)),
+            ("Network stack", self.tracked_network_packages(installed)),
+            ("External drivers / DKMS", self.tracked_external_driver_packages(installed)),
+            ("Boot chain", self.tracked_boot_packages(installed)),
+        ]
+        groups.extend((title, rows) for title, rows in optional_groups if rows)
+        return groups
+
+    def tracked_priority_rows(self, installed: dict[str, str]) -> list[tuple[str, str]]:
+        deduped: dict[str, str] = {}
+        for _title, rows in self.tracked_priority_groups(installed):
+            for name, version in rows:
+                deduped[name] = version
+        return list(deduped.items())
+
+    @staticmethod
     def package_line(name: str, installed_version: str, latest_version: str | None) -> str:
         if latest_version and latest_version != installed_version:
             return f"{name}: {installed_version} -> {latest_version}"
         return f"{name}: {installed_version} current"
+
+    @staticmethod
+    def package_group_lines(
+        title: str,
+        rows: Sequence[tuple[str, str]],
+        updates: dict[str, tuple[str, str]],
+        expand_current: int = 2,
+        expand_outdated: int = 3,
+    ) -> list[str]:
+        if not rows:
+            return []
+        outdated_rows = [
+            (name, version, latest)
+            for name, version in rows
+            if (latest := PackageMonitor.latest_version_for(name, updates)) is not None and latest != version
+        ]
+        lines = [f"{title}: {len(outdated_rows)}/{len(rows)} outdated"]
+        if outdated_rows:
+            for name, version, latest in outdated_rows[:expand_outdated]:
+                lines.append(f"  {PackageMonitor.package_line(name, version, latest)}")
+            remaining = len(outdated_rows) - expand_outdated
+            if remaining > 0:
+                lines.append(f"  ... plus {remaining} more outdated package(s)")
+            return lines
+        if len(rows) <= expand_current:
+            for name, version in rows:
+                lines.append(
+                    f"  {PackageMonitor.package_line(name, version, PackageMonitor.latest_version_for(name, updates))}"
+                )
+            return lines
+        preview = ", ".join(name for name, _version in rows[:expand_current])
+        extra = len(rows) - expand_current
+        if extra > 0:
+            preview += f", +{extra} more"
+        lines.append(f"  installed: {preview}")
+        return lines
 
     @staticmethod
     def latest_version_for(name: str, updates: dict[str, tuple[str, str]]) -> str | None:
@@ -625,10 +786,8 @@ class PackageMonitor:
         total_pending = len(state.official_updates) + len(state.aur_updates)
         lines.extend(self.package_refresh_lines(state))
         kernel_updates = {**state.aur_updates, **state.official_updates}
-        kernel_packages = self.tracked_kernel_packages(installed)
-        firmware_packages = self.tracked_firmware_versions(installed)
-        nvidia_packages = self.tracked_nvidia_packages(installed)
-        tracked_rows = [*kernel_packages, *firmware_packages, *nvidia_packages]
+        tracked_groups = self.tracked_priority_groups(installed)
+        tracked_rows = self.tracked_priority_rows(installed)
         tracked_outdated = sum(
             1
             for name, version in tracked_rows
@@ -657,31 +816,12 @@ class PackageMonitor:
             if errors:
                 note_parts.append(" / ".join(errors))
             lines.append("  Package marks: " + " | ".join(note_parts))
-        lines.append(f"  Tracked critical packages outdated: {tracked_outdated}/{len(tracked_rows)}")
-        lines.append("Kernel:")
-        lines.append(f"  running kernel: {running_kernel}")
-        if kernel_packages:
-            for name, version in kernel_packages:
-                latest = self.latest_version_for(name, kernel_updates)
-                lines.append(f"  {self.package_line(name, version, latest)}")
-        else:
-            lines.append("  no tracked kernel package installed")
-        lines.append("Firmware:")
-        if firmware_packages:
-            for name, version in firmware_packages:
-                latest = self.latest_version_for(name, kernel_updates)
-                lines.append(f"  {self.package_line(name, version, latest)}")
-        else:
-            lines.append("  no tracked firmware package installed")
-        if self.backend.nvidia_monitoring_enabled() or nvidia_packages:
-            lines.append("NVIDIA:")
-            lines.append(f"  loaded module: {nvidia_module}")
-            if nvidia_packages:
-                for name, version in nvidia_packages:
-                    latest = self.latest_version_for(name, kernel_updates)
-                    lines.append(f"  {self.package_line(name, version, latest)}")
-            else:
-                lines.append("  no tracked NVIDIA package installed")
+        lines.append(f"  Tracked priority packages outdated: {tracked_outdated}/{len(tracked_rows)}")
+        lines.append(f"Kernel runtime: {running_kernel}")
+        if self.backend.nvidia_monitoring_enabled():
+            lines.append(f"NVIDIA runtime: {nvidia_module}")
+        for title, rows in tracked_groups:
+            lines.extend(self.package_group_lines(title, rows, kernel_updates))
         return lines
 
     def collect_update_backlog(self, source: str) -> list[str]:
