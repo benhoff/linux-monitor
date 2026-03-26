@@ -24,9 +24,9 @@ monitor-tui
 monitor-package-cleanup
 ```
 
-If you are running directly from the repo without installing entrypoints, the repo-root
-`monitor_tui.py`, `package_cleanup_tui.py`, and `monitor_privileged_snapshot.py`
-files remain as compatibility wrappers.
+If you are running directly from the repo without installing entrypoints, use the repo-root
+`monitor_tui.py` and `package_cleanup_tui.py` wrappers, or run
+`bin/monitor_privileged_snapshot.py` for the privileged snapshot helper.
 
 ## Keys
 

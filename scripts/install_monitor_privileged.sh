@@ -12,7 +12,7 @@ REFRESH_INTERVAL="${MONITOR_SNAPSHOT_INTERVAL:-2min}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-SOURCE_SCRIPT="${REPO_ROOT}/monitor_privileged_snapshot.py"
+SOURCE_SCRIPT="${REPO_ROOT}/bin/monitor_privileged_snapshot.py"
 SOURCE_REFRESH="${SCRIPT_DIR}/refresh_monitor_privileged.sh"
 SOURCE_PACKAGE_ROOT="${REPO_ROOT}/src/monitor"
 SOURCE_APP_INIT="${SOURCE_PACKAGE_ROOT}/app/__init__.py"
