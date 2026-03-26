@@ -110,6 +110,8 @@ python3 monitor_tui.py --once --tab all
 - DNS probe targets and package-cache labels are distro-aware, so Debian-family systems use Debian/Ubuntu package and mirror conventions instead of Arch-specific ones.
 - Debian and Ubuntu package hygiene uses `apt`/`apt-mark` where available, while AUR-specific features stay Arch-only.
 - Tier 3 includes a `Bluetooth` panel that tracks service state, adapter/rfkill visibility, controller power/discoverability, connected and paired devices, and recent Bluetooth journal hints when those signals are available.
+- Tier 3 `System Hygiene` now surfaces package-cache age/count, large watched directories, config drift under `/etc`, scheduled task hygiene, and container/VM leftovers.
+- Tier 3 `Security / Exposure Surface` now calls out services listening on non-loopback addresses before listing all sockets.
 
 ## Privileged Snapshot
 

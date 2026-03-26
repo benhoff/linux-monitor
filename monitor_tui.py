@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import curses
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -71,6 +72,41 @@ WATCHED_DIRS = (
     Path("/var/lib/systemd/coredump"),
     Path.home() / ".cache",
 )
+CONFIG_DRIFT_SUFFIXES = (
+    ".pacnew",
+    ".pacsave",
+    ".pacorig",
+    ".dpkg-dist",
+    ".dpkg-old",
+    ".ucf-dist",
+    ".ucf-old",
+)
+CRON_FILES = (
+    Path("/etc/crontab"),
+    Path("/etc/anacrontab"),
+)
+CRON_DIRS = (
+    Path("/etc/cron.d"),
+    Path("/etc/cron.hourly"),
+    Path("/etc/cron.daily"),
+    Path("/etc/cron.weekly"),
+    Path("/etc/cron.monthly"),
+)
+CRON_SPOOL_DIRS = (
+    Path("/var/spool/cron"),
+    Path("/var/spool/cron/crontabs"),
+)
+CONTAINER_DATA_DIRS = (
+    Path("/var/lib/docker"),
+    Path("/var/lib/containers/storage"),
+    Path.home() / ".local/share/containers/storage",
+)
+VM_IMAGE_DIRS = (
+    Path("/var/lib/libvirt/images"),
+    Path.home() / ".local/share/libvirt/images",
+    Path.home() / "VirtualBox VMs",
+)
+VM_IMAGE_SUFFIXES = (".qcow2", ".img", ".vdi", ".vmdk", ".vhd", ".vhdx")
 ENCODER_KEYWORDS = ("nvenc", "vaapi", "v4l2m2m", "qsv", "amf", "rkmpp")
 DEVICE_LOG_PATTERN = r"HDMI|EDID|drm|v4l2|CSI|camera|encoder|nvenc|mpp|video"
 CAPTURE_LOG_PATTERN = r"AVMatrix|HwsCapture|uvcvideo|videodev|v4l2|capture"
@@ -324,6 +360,48 @@ def line_list(text: str, limit: int | None = None) -> list[str]:
     if limit is not None:
         return lines[:limit]
     return lines
+
+
+def summarize_list(items: Sequence[str], limit: int = 3) -> str:
+    values = [item for item in items if item]
+    if not values:
+        return "none"
+    if len(values) <= limit:
+        return ", ".join(values)
+    return ", ".join(values[:limit]) + f", +{len(values) - limit} more"
+
+
+def split_socket_endpoint(endpoint: str) -> tuple[str, str]:
+    value = endpoint.strip()
+    if value.startswith("["):
+        end = value.find("]")
+        if end != -1:
+            host = value[1:end]
+            remainder = value[end + 1 :]
+            if remainder.startswith(":"):
+                return host, remainder[1:]
+            return host, ""
+    host, sep, port = value.rpartition(":")
+    if sep:
+        return host, port
+    return value, ""
+
+
+def is_loopback_endpoint(endpoint: str) -> bool:
+    host, _port = split_socket_endpoint(endpoint)
+    host = host.strip().strip("[]")
+    if not host:
+        return False
+    lowered = host.lower()
+    if lowered in {"localhost", "ip6-localhost"}:
+        return True
+    if lowered == "*":
+        return False
+    host = host.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def journal_line_list(text: str, limit: int | None = None) -> list[str]:
@@ -4290,22 +4368,43 @@ class MonitorBackend:
         return lines
 
     def _listening_sockets(self) -> list[str]:
-        result = run_command(["ss", "-ltnupH"], timeout=4.0)
-        sockets = []
-        for raw in line_list(result.stdout):
-            parts = raw.split()
-            if len(parts) < 5:
-                continue
-            local = parts[4]
-            process = parts[-1] if parts else ""
-            sockets.append(f"{local} {process}")
+        rows, error = self._listener_rows()
+        sockets = [f"{local} {process}".strip() for _proto, local, process in rows]
         if sockets:
             return sockets[:8]
-        if result.missing:
-            return ["ss not found."]
-        if result.stderr:
-            return [shorten(first_nonempty_line(result.stderr), 140)]
+        if error:
+            return [error]
         return ["No listening sockets."]
+
+    def _listener_rows(self) -> tuple[list[tuple[str, str, str]], str | None]:
+        result = run_command(["ss", "-ltnupH"], timeout=4.0)
+        rows: list[tuple[str, str, str]] = []
+        if result.stdout or result.ok:
+            for raw in line_list(result.stdout):
+                parts = raw.split()
+                if len(parts) < 5:
+                    continue
+                proto = parts[0]
+                local = parts[4]
+                process = parts[-1] if len(parts) >= 6 else ""
+                rows.append((proto, local, process))
+            return rows, None
+        if result.missing:
+            return [], "ss not found."
+        if result.timed_out:
+            return [], "ss timed out."
+        if result.stderr:
+            return [], shorten(first_nonempty_line(result.stderr), 140)
+        return [], None
+
+    def _non_loopback_listeners(self) -> tuple[list[str], str | None]:
+        rows, error = self._listener_rows()
+        exposed = [
+            f"{proto} {local} {process}".strip()
+            for proto, local, process in rows
+            if not is_loopback_endpoint(local)
+        ]
+        return exposed[:8], error
 
     def _failed_logins(self) -> list[str]:
         result = run_command(
@@ -4331,6 +4430,7 @@ class MonitorBackend:
         return journal_line_list(result.stdout, limit=5)
 
     def collect_security(self) -> list[str]:
+        exposed, exposed_error = self.cached("non_loopback_listeners", 30.0, self._non_loopback_listeners)
         privileged = self._privileged_section("security")
         if privileged:
             snapshot_line = self._privileged_snapshot_line()
@@ -4340,6 +4440,13 @@ class MonitorBackend:
             lines = []
             if snapshot_line:
                 lines.append(snapshot_line)
+            lines.append(
+                f"Non-loopback listeners: {len(exposed)}"
+                + (f" ({exposed_error})" if exposed_error else "")
+            )
+            if exposed:
+                for item in exposed[:4]:
+                    lines.append(f"  {shorten(item, 140)}")
             lines.append("Listening sockets:")
             if isinstance(listeners, list) and listeners:
                 for item in listeners[:6]:
@@ -4363,7 +4470,13 @@ class MonitorBackend:
         failed_logins = self._failed_logins()
         sudo_usage = self._sudo_usage()
 
-        lines = ["Listening sockets:"]
+        lines = [
+            f"Non-loopback listeners: {len(exposed)}" + (f" ({exposed_error})" if exposed_error else "")
+        ]
+        if exposed:
+            for item in exposed[:4]:
+                lines.append(f"  {shorten(item, 140)}")
+        lines.append("Listening sockets:")
         for item in listeners[:6]:
             lines.append(f"  {item}")
 
@@ -4387,6 +4500,207 @@ class MonitorBackend:
             return None
         return parse_int(result.stdout.split()[0], default=-1)
 
+    def _package_cache_stats(self) -> dict[str, object]:
+        path = self.package_cache_path
+        stats: dict[str, object] = {
+            "label": self.package_cache_label,
+            "path": str(path) if path is not None else "",
+            "size": None,
+            "files": 0,
+            "oldest_age": None,
+        }
+        if path is None or not path.exists():
+            return stats
+        stats["size"] = self._path_size(path, timeout=8.0)
+        oldest_age: int | None = None
+        file_count = 0
+        now = time.time()
+        try:
+            for entry in path.iterdir():
+                try:
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                if self.package_backend == "pacman" and ".pkg.tar" not in entry.name:
+                    continue
+                if self.package_backend == "apt" and not entry.name.endswith(".deb"):
+                    continue
+                file_count += 1
+                try:
+                    age = max(int(now - entry.stat().st_mtime), 0)
+                except OSError:
+                    continue
+                oldest_age = age if oldest_age is None else max(oldest_age, age)
+        except OSError:
+            return stats
+        stats["files"] = file_count
+        stats["oldest_age"] = oldest_age
+        return stats
+
+    def _config_drift_files(self) -> tuple[list[str], str | None]:
+        root = Path("/etc")
+        if not root.exists():
+            return [], "/etc not found"
+        matches: list[str] = []
+        try:
+            for current_root, _dirs, files in os.walk(root, followlinks=False):
+                for name in files:
+                    lowered = name.lower()
+                    if not lowered.endswith(CONFIG_DRIFT_SUFFIXES):
+                        continue
+                    full_path = Path(current_root) / name
+                    matches.append(str(full_path.relative_to(root)))
+        except OSError as exc:
+            return [], shorten(str(exc), 120)
+        matches.sort()
+        return matches, None
+
+    def _count_crontab_lines(self, path: Path) -> int:
+        count = 0
+        for raw in read_lines(path):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line and not re.match(r"^(@|\d|\*)", line):
+                continue
+            count += 1
+        return count
+
+    def _cron_entry_count(self) -> int:
+        count = 0
+        for path in CRON_FILES:
+            if path.exists():
+                count += self._count_crontab_lines(path)
+        for directory in (*CRON_DIRS, *CRON_SPOOL_DIRS):
+            if not directory.exists():
+                continue
+            try:
+                count += sum(1 for entry in directory.iterdir() if entry.is_file() and not entry.name.startswith("."))
+            except OSError:
+                continue
+        return count
+
+    def _timer_hygiene(self) -> dict[str, object]:
+        enabled_count, enabled_error = self.count_command_lines(
+            ["systemctl", "list-unit-files", "--type=timer", "--state=enabled", "--no-legend", "--no-pager"],
+            timeout=5.0,
+        )
+        failed_lines, failed_error = self.command_lines(
+            ["systemctl", "--failed", "--type=timer", "--no-legend", "--no-pager"],
+            timeout=5.0,
+        )
+        failed_timers = [line.split()[0] for line in failed_lines if line.split()]
+        no_next_run: list[str] = []
+        timers_error: str | None = None
+        result = run_command(["systemctl", "list-timers", "--all", "--no-legend", "--no-pager"], timeout=6.0)
+        if result.stdout or result.ok:
+            for raw in line_list(result.stdout):
+                parts = raw.rsplit(None, 2)
+                if len(parts) < 3:
+                    continue
+                prefix, unit, _activates = parts
+                if prefix.startswith("n/a"):
+                    no_next_run.append(unit)
+        elif result.missing:
+            timers_error = "systemctl not found"
+        elif result.timed_out:
+            timers_error = "systemctl timed out"
+        elif result.stderr:
+            timers_error = shorten(single_line(result.stderr), 120)
+        return {
+            "enabled_count": enabled_count,
+            "enabled_error": enabled_error,
+            "failed_timers": failed_timers,
+            "failed_error": failed_error,
+            "no_next_run": no_next_run,
+            "timers_error": timers_error,
+            "cron_count": self._cron_entry_count(),
+        }
+
+    def _vm_image_inventory(self) -> list[tuple[str, int]]:
+        images: list[tuple[str, int]] = []
+        for base in VM_IMAGE_DIRS:
+            if not base.exists():
+                continue
+            for current_root, _dirs, files in os.walk(base, followlinks=False):
+                for name in files:
+                    if not name.lower().endswith(VM_IMAGE_SUFFIXES):
+                        continue
+                    path = Path(current_root) / name
+                    try:
+                        size = path.stat().st_size
+                    except OSError:
+                        continue
+                    images.append((str(path), size))
+        images.sort(key=lambda item: item[1], reverse=True)
+        return images
+
+    def _container_vm_hygiene(self) -> dict[str, object]:
+        docker_data = self._path_size(Path("/var/lib/docker"), timeout=8.0)
+        podman_root = self._path_size(Path("/var/lib/containers/storage"), timeout=8.0)
+        podman_user = self._path_size(Path.home() / ".local/share/containers/storage", timeout=8.0)
+
+        docker_exited: int | None = None
+        docker_dangling_images: int | None = None
+        docker_dangling_volumes: int | None = None
+        if shutil.which("docker") is not None:
+            docker_exited, _ = self.count_command_lines(
+                ["docker", "ps", "-aq", "--filter", "status=exited"],
+                timeout=5.0,
+            )
+            docker_dangling_images, _ = self.count_command_lines(
+                ["docker", "images", "-q", "--filter", "dangling=true"],
+                timeout=5.0,
+            )
+            docker_dangling_volumes, _ = self.count_command_lines(
+                ["docker", "volume", "ls", "-q", "--filter", "dangling=true"],
+                timeout=5.0,
+            )
+
+        podman_exited: int | None = None
+        podman_dangling_images: int | None = None
+        if shutil.which("podman") is not None:
+            podman_exited, _ = self.count_command_lines(
+                ["podman", "ps", "-aq", "--filter", "status=exited"],
+                timeout=5.0,
+            )
+            podman_dangling_images, _ = self.count_command_lines(
+                ["podman", "images", "-q", "--filter", "dangling=true"],
+                timeout=5.0,
+            )
+
+        vm_images = self._vm_image_inventory()
+        summary_parts: list[str] = []
+        if isinstance(docker_data, int) and docker_data > 0:
+            summary_parts.append(f"docker data {format_bytes(docker_data)}")
+        if isinstance(docker_exited, int) and docker_exited > 0:
+            summary_parts.append(f"{docker_exited} exited docker ctrs")
+        if isinstance(docker_dangling_images, int) and docker_dangling_images > 0:
+            summary_parts.append(f"{docker_dangling_images} dangling docker images")
+        if isinstance(docker_dangling_volumes, int) and docker_dangling_volumes > 0:
+            summary_parts.append(f"{docker_dangling_volumes} dangling docker volumes")
+        if isinstance(podman_root, int) and podman_root > 0:
+            summary_parts.append(f"podman root {format_bytes(podman_root)}")
+        if isinstance(podman_user, int) and podman_user > 0:
+            summary_parts.append(f"podman user {format_bytes(podman_user)}")
+        if isinstance(podman_exited, int) and podman_exited > 0:
+            summary_parts.append(f"{podman_exited} exited podman ctrs")
+        if isinstance(podman_dangling_images, int) and podman_dangling_images > 0:
+            summary_parts.append(f"{podman_dangling_images} dangling podman images")
+        if vm_images:
+            total_vm_size = sum(size for _path, size in vm_images)
+            summary_parts.append(f"{len(vm_images)} VM image(s) {format_bytes(total_vm_size)}")
+
+        details = [
+            f"{self._abbreviate_path(path)} {format_bytes(size)}"
+            for path, size in vm_images[:3]
+        ]
+        return {
+            "summary": "Container / VM leftovers: " + (" | ".join(summary_parts) if summary_parts else "none obvious"),
+            "details": details,
+        }
+
     def _journal_disk_usage(self) -> str:
         result = run_command(["journalctl", "--disk-usage"], timeout=3.0)
         if result.stdout:
@@ -4399,15 +4713,11 @@ class MonitorBackend:
 
     def collect_hygiene(self) -> list[str]:
         orphaned, orphan_error = self.cached("orphans_hygiene", 900.0, self._orphan_packages)
-        package_cache = (
-            self.cached(
-                "package_cache_size",
-                300.0,
-                lambda: self._path_size(self.package_cache_path) if self.package_cache_path is not None else None,
-            )
-            if self.package_cache_path is not None
-            else None
-        )
+        package_cache = self.cached("package_cache_stats", 300.0, self._package_cache_stats)
+        dir_sizes = self.cached("dir_sizes", 300.0, self._directory_sizes)
+        config_drift, config_error = self.cached("config_drift_files", 600.0, self._config_drift_files)
+        timer_hygiene = self.cached("timer_hygiene", 300.0, self._timer_hygiene)
+        container_vm = self.cached("container_vm_hygiene", 600.0, self._container_vm_hygiene)
         log_dir = self.cached("log_dir_size", 300.0, lambda: self._path_size(Path("/var/log")))
         tmp_dir = self.cached("tmp_dir_size", 300.0, lambda: self._path_size(Path("/tmp")))
         var_tmp_dir = self.cached("var_tmp_dir_size", 300.0, lambda: self._path_size(Path("/var/tmp")))
@@ -4418,10 +4728,26 @@ class MonitorBackend:
         ]
         if orphaned:
             lines.append(f"  {', '.join(orphaned[:10])}")
-        lines.append(
-            self.package_cache_label + ": "
-            + (format_bytes(package_cache) if isinstance(package_cache, int) and package_cache >= 0 else "unavailable")
-        )
+        if isinstance(package_cache, dict):
+            cache_size = package_cache.get("size")
+            cache_files = int(package_cache.get("files", 0))
+            oldest_age = package_cache.get("oldest_age")
+            cache_line = (
+                str(package_cache.get("label", self.package_cache_label))
+                + ": "
+                + (
+                    format_bytes(cache_size)
+                    if isinstance(cache_size, int) and cache_size >= 0
+                    else "unavailable"
+                )
+            )
+            if cache_files > 0:
+                cache_line += f" across {cache_files} file(s)"
+            if isinstance(oldest_age, int) and oldest_age > 0:
+                cache_line += f" | oldest {self._age_label(oldest_age)}"
+            lines.append(cache_line)
+        else:
+            lines.append(self.package_cache_label + ": unavailable")
         lines.append(
             "Log directory: " + (format_bytes(log_dir) if isinstance(log_dir, int) and log_dir >= 0 else "unavailable")
         )
@@ -4442,6 +4768,58 @@ class MonitorBackend:
         )
         if lines[-1] == "Temp usage: ":
             lines[-1] = "Temp usage: unavailable"
+        noisy_dirs = [(path, size) for path, size in dir_sizes if size >= 512 * 1024**2]
+        if noisy_dirs:
+            lines.append(
+                "Large directories: "
+                + ", ".join(
+                    f"{self._abbreviate_path(path)} {format_bytes(size)}"
+                    for path, size in noisy_dirs[:4]
+                )
+            )
+        else:
+            lines.append("Large directories: none above 512 MiB in watched paths.")
+
+        if config_error:
+            lines.append(f"Config drift: unavailable ({config_error})")
+        else:
+            lines.append(f"Config drift: {len(config_drift)} tracked leftover file(s) under /etc")
+            for item in config_drift[:4]:
+                lines.append(f"  {item}")
+
+        if isinstance(timer_hygiene, dict):
+            enabled_count = timer_hygiene.get("enabled_count")
+            enabled_display = str(enabled_count) if isinstance(enabled_count, int) else "n/a"
+            failed_timers = timer_hygiene.get("failed_timers", [])
+            no_next_run = timer_hygiene.get("no_next_run", [])
+            cron_count = int(timer_hygiene.get("cron_count", 0))
+            timer_notes = ", ".join(
+                note
+                for note in (
+                    timer_hygiene.get("enabled_error"),
+                    timer_hygiene.get("failed_error"),
+                    timer_hygiene.get("timers_error"),
+                )
+                if isinstance(note, str) and note
+            )
+            lines.append(
+                f"Scheduled tasks: {enabled_display} enabled timer(s) | "
+                f"{len(failed_timers) if isinstance(failed_timers, list) else 0} failed | "
+                f"{cron_count} cron entry/file(s)"
+                + (f" ({timer_notes})" if timer_notes else "")
+            )
+            if isinstance(failed_timers, list) and failed_timers:
+                lines.append(f"  Failed timers: {summarize_list(failed_timers, limit=3)}")
+            if isinstance(no_next_run, list) and no_next_run:
+                lines.append(f"  No next run: {summarize_list(no_next_run, limit=3)}")
+
+        if isinstance(container_vm, dict):
+            summary = str(container_vm.get("summary", "Container / VM leftovers: none obvious"))
+            lines.append(summary)
+            details = container_vm.get("details", [])
+            if isinstance(details, list):
+                for item in details[:2]:
+                    lines.append(f"  {shorten(str(item), 140)}")
         return lines
 
     def _boot_time(self) -> str:
