@@ -66,13 +66,13 @@ class DashboardModel:
         if backend.package_monitoring_enabled():
             collectors.insert(
                 4,
-                Collector("packages", "tier1", "Kernel / Firmware / NVIDIA", 5, backend.collect_packages),
+                Collector("packages", "tier1", "Kernel / Firmware / NVIDIA", 30, backend.collect_packages),
             )
             collectors.append(
-                Collector("pending_updates", "packages", "Official Repo Updates", 15, backend.collect_pending_updates)
+                Collector("pending_updates", "packages", "Official Repo Updates", 60, backend.collect_pending_updates)
             )
             if backend.supports_aur:
-                collectors.append(Collector("aur_updates", "aur", "AUR Updates", 15, backend.collect_aur_updates))
+                collectors.append(Collector("aur_updates", "aur", "AUR Updates", 60, backend.collect_aur_updates))
         if backend.capture_monitoring_enabled():
             collectors.insert(
                 12 if backend.package_monitoring_enabled() else 11,
@@ -171,4 +171,3 @@ class DashboardModel:
     def stop(self) -> None:
         self.stop_event.set()
         self.backend.stop_background_tasks()
-

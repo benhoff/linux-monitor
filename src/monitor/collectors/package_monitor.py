@@ -610,7 +610,7 @@ class PackageMonitor:
         return upgrades
 
     def collect_packages(self) -> list[str]:
-        installed = self.backend.cached("installed_packages", 30.0, self.installed_packages)
+        installed = self.backend.cached("installed_packages", 300.0, self.installed_packages)
         foreign: list[str] = []
         foreign_error: str | None = None
         if self.backend.package_backend == "pacman":
