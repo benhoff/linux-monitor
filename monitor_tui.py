@@ -685,7 +685,7 @@ class MonitorBackend:
         return "Package cache", None
 
     def package_monitoring_enabled(self) -> bool:
-        return self.package_backend == "pacman"
+        return self.package_backend in {"pacman", "apt"}
 
     def nvidia_monitoring_enabled(self) -> bool:
         return bool(self.cached("nvidia_monitoring_enabled", 60.0, self._detect_nvidia_monitoring))
@@ -1523,9 +1523,13 @@ class MonitorBackend:
                 aur_error=self.package_state.aur_error,
             )
 
-    @staticmethod
-    def _package_refresh_lines(state: PackageRefreshState) -> list[str]:
+    def _package_refresh_lines(self, state: PackageRefreshState) -> list[str]:
         lines: list[str] = []
+        source_label = {
+            "pacman": "pacman/checkupdates",
+            "apt": "apt package metadata",
+        }.get(self.package_backend, "package metadata")
+        lines.append(f"Package source: {source_label} | privileged snapshot not required")
         if state.loading and state.last_updated == 0.0:
             lines.append("Background refresh: syncing latest package metadata...")
         elif state.loading:
@@ -1583,24 +1587,51 @@ class MonitorBackend:
             return {}, None
         names = sorted(updates)
         timeout = min(max(8.0, len(names) * 0.4), 30.0)
-        result = run_command(["pacman", "-Si", *names], timeout=timeout)
-        if not result.stdout:
-            if result.missing:
-                return {}, "pacman not found"
-            if result.timed_out:
-                return {}, "pacman -Si timed out"
-            if result.stderr:
-                return {}, shorten(single_line(result.stderr), 120)
-            return {}, "pacman -Si returned no data"
+        if self.package_backend == "pacman":
+            result = run_command(["pacman", "-Si", *names], timeout=timeout)
+            if not result.stdout:
+                if result.missing:
+                    return {}, "pacman not found"
+                if result.timed_out:
+                    return {}, "pacman -Si timed out"
+                if result.stderr:
+                    return {}, shorten(single_line(result.stderr), 120)
+                return {}, "pacman -Si returned no data"
+        elif self.package_backend == "apt":
+            result = run_command(["apt-cache", "show", *names], timeout=timeout)
+            if not result.stdout:
+                if result.missing:
+                    return {}, "apt-cache not found"
+                if result.timed_out:
+                    return {}, "apt-cache show timed out"
+                if result.stderr:
+                    return {}, shorten(single_line(result.stderr), 120)
+                return {}, "apt-cache show returned no data"
+        else:
+            return {}, "repo metadata is unavailable for this package backend"
         metadata: dict[str, dict[str, int | str | None]] = {}
         for block in self._parse_info_blocks(result.stdout):
             name = block.get("Name")
             if not name:
                 continue
+            if self.package_backend == "pacman":
+                metadata[name] = {
+                    "version": block.get("Version"),
+                    "download_size": parse_size_bytes(block.get("Download Size", "")),
+                    "installed_size": parse_size_bytes(block.get("Installed Size", "")),
+                }
+                continue
+
+            version = block.get("Version")
+            latest = updates.get(name, ("", ""))[1]
+            if latest and version and version != latest and name in metadata:
+                continue
+            download_size = parse_int(block.get("Size", ""), default=-1)
+            installed_size = parse_int(block.get("Installed-Size", ""), default=-1)
             metadata[name] = {
-                "version": block.get("Version"),
-                "download_size": parse_size_bytes(block.get("Download Size", "")),
-                "installed_size": parse_size_bytes(block.get("Installed Size", "")),
+                "version": version,
+                "download_size": download_size if download_size >= 0 else None,
+                "installed_size": installed_size * 1024 if installed_size >= 0 else None,
             }
         return metadata, None
 
@@ -1732,33 +1763,62 @@ class MonitorBackend:
             return match.group(1)
         return "unavailable"
 
-    @staticmethod
-    def _tracked_kernel_packages(installed: dict[str, str]) -> list[tuple[str, str]]:
-        return [(name, installed[name]) for name in KERNEL_PACKAGE_NAMES if name in installed]
+    def _tracked_kernel_packages(self, installed: dict[str, str]) -> list[tuple[str, str]]:
+        if self.package_backend == "pacman":
+            return [(name, installed[name]) for name in KERNEL_PACKAGE_NAMES if name in installed]
+        if self.package_backend == "apt":
+            running_kernel_pkg = f"linux-image-{self._running_kernel_version()}"
+            preferred: list[str] = []
+            for name in installed:
+                if name == running_kernel_pkg:
+                    preferred.append(name)
+                elif name.startswith(("linux-generic", "linux-image-generic", "linux-headers-generic")):
+                    preferred.append(name)
+                elif name.startswith("linux-image-") and name.endswith("-generic"):
+                    preferred.append(name)
+            unique = sorted(dict.fromkeys(preferred))
+            return [(name, installed[name]) for name in unique[:6]]
+        return []
 
-    @staticmethod
-    def _tracked_firmware_versions(installed: dict[str, str]) -> list[tuple[str, str]]:
-        versions = sorted(
-            {
-                version
+    def _tracked_firmware_versions(self, installed: dict[str, str]) -> list[tuple[str, str]]:
+        if self.package_backend == "pacman":
+            versions = sorted(
+                {
+                    version
+                    for name, version in installed.items()
+                    if name.startswith(FIRMWARE_PACKAGE_PREFIXES)
+                }
+            )
+            rows: list[tuple[str, str]] = []
+            if versions:
+                if len(versions) == 1:
+                    rows.append(("linux-firmware*", versions[0]))
+                else:
+                    rows.append(("linux-firmware*", ", ".join(versions)))
+            for name in FIRMWARE_PACKAGE_NAMES:
+                if name in installed:
+                    rows.append((name, installed[name]))
+            return rows
+        if self.package_backend == "apt":
+            rows: list[tuple[str, str]] = []
+            for name in ("linux-firmware", "intel-microcode", "amd64-microcode"):
+                if name in installed:
+                    rows.append((name, installed[name]))
+            return rows
+        return []
+
+    def _tracked_nvidia_packages(self, installed: dict[str, str]) -> list[tuple[str, str]]:
+        if self.package_backend == "pacman":
+            return [(name, installed[name]) for name in NVIDIA_PACKAGE_NAMES if name in installed]
+        if self.package_backend == "apt":
+            rows = [
+                (name, version)
                 for name, version in installed.items()
-                if name.startswith(FIRMWARE_PACKAGE_PREFIXES)
-            }
-        )
-        rows: list[tuple[str, str]] = []
-        if versions:
-            if len(versions) == 1:
-                rows.append(("linux-firmware*", versions[0]))
-            else:
-                rows.append(("linux-firmware*", ", ".join(versions)))
-        for name in FIRMWARE_PACKAGE_NAMES:
-            if name in installed:
-                rows.append((name, installed[name]))
-        return rows
-
-    @staticmethod
-    def _tracked_nvidia_packages(installed: dict[str, str]) -> list[tuple[str, str]]:
-        return [(name, installed[name]) for name in NVIDIA_PACKAGE_NAMES if name in installed]
+                if name.startswith(("nvidia-driver-", "nvidia-utils-", "linux-modules-nvidia-"))
+            ]
+            rows.sort(key=lambda item: item[0])
+            return rows[:8]
+        return []
 
     @staticmethod
     def _package_line(name: str, installed_version: str, latest_version: str | None) -> str:
@@ -1813,8 +1873,32 @@ class MonitorBackend:
         return 0, None
 
     def _official_updates(self) -> tuple[list[str], str | None]:
+        if self.package_backend == "apt":
+            result = run_command(["apt", "list", "--upgradable"], timeout=12.0)
+            if result.stdout:
+                lines: list[str] = []
+                for raw in result.stdout.splitlines():
+                    line = raw.strip()
+                    if not line or line.lower().startswith("listing"):
+                        continue
+                    match = re.match(
+                        r"^([^/]+)/\S+\s+(\S+)\s+\S+\s+\[upgradable from: (\S+)\]$",
+                        line,
+                    )
+                    if not match:
+                        continue
+                    name, latest, current = match.groups()
+                    lines.append(f"{name} {current} -> {latest}")
+                return lines, None
+            if result.missing:
+                return [], "apt not found"
+            if result.timed_out:
+                return [], "apt list timed out"
+            if result.stderr:
+                return [], shorten(single_line(result.stderr), 120)
+            return [], None
         if self.package_backend != "pacman":
-            return [], "repo update monitoring is only implemented for pacman systems"
+            return [], "repo update monitoring is unavailable for this package backend"
         return self.command_lines(
             ["checkupdates"],
             fallback=["pacman", "-Qu"],
@@ -1827,11 +1911,15 @@ class MonitorBackend:
         return self.command_lines(["yay", "-Qua"], timeout=12.0)
 
     def _count_explicit(self) -> tuple[int | None, str | None]:
+        if self.package_backend == "apt":
+            return self.count_command_lines(["apt-mark", "showmanual"], timeout=6.0)
         if self.package_backend != "pacman":
             return None, "explicit package count is only implemented for pacman systems"
         return self.count_command_lines(["pacman", "-Qe"])
 
     def _count_dependencies(self) -> tuple[int | None, str | None]:
+        if self.package_backend == "apt":
+            return self.count_command_lines(["apt-mark", "showauto"], timeout=6.0)
         if self.package_backend != "pacman":
             return None, "dependency package count is only implemented for pacman systems"
         return self.count_command_lines(["pacman", "-Qd"])
@@ -1898,8 +1986,13 @@ class MonitorBackend:
 
     def collect_packages(self) -> list[str]:
         installed = self.cached("installed_packages", 30.0, self._installed_packages)
-        foreign, foreign_error = self.cached("foreign", 900.0, self._foreign_packages)
+        foreign: list[str] = []
+        foreign_error: str | None = None
+        if self.package_backend == "pacman":
+            foreign, foreign_error = self.cached("foreign", 900.0, self._foreign_packages)
         ignored = self.cached("ignored", 1800.0, self._ignored_packages)
+        explicit_count, explicit_error = self.cached("count_explicit", 900.0, self._count_explicit)
+        dependency_count, dependency_error = self.cached("count_dependencies", 900.0, self._count_dependencies)
         running_kernel = self._running_kernel_version()
         nvidia_module = self._nvidia_module_version()
         state = self._package_state_snapshot()
@@ -1925,20 +2018,34 @@ class MonitorBackend:
 
         lines.append("Summary:")
         repo_summary = "?" if state.official_error else str(len(state.official_updates))
-        aur_summary = "?" if state.aur_error else str(len(state.aur_updates))
-        total_summary = (
-            "unknown"
-            if state.official_error or state.aur_error
-            else str(total_pending)
-        )
-        lines.append(
-            f"  Pending updates: {total_summary} total | {repo_summary} repo | {aur_summary} AUR"
-        )
-        lines.append(
-            f"  Installed foreign packages: {len(foreign)}"
-            + (f" ({foreign_error})" if foreign_error else "")
-            + f" | ignored packages: {len(ignored)}"
-        )
+        if self.supports_aur:
+            aur_summary = "?" if state.aur_error else str(len(state.aur_updates))
+            total_summary = (
+                "unknown"
+                if state.official_error or state.aur_error
+                else str(total_pending)
+            )
+            lines.append(
+                f"  Pending updates: {total_summary} total | {repo_summary} repo | {aur_summary} AUR"
+            )
+        else:
+            total_summary = "unknown" if state.official_error else str(len(state.official_updates))
+            lines.append(f"  Pending updates: {total_summary} repo")
+
+        if self.package_backend == "pacman":
+            lines.append(
+                f"  Installed foreign packages: {len(foreign)}"
+                + (f" ({foreign_error})" if foreign_error else "")
+                + f" | ignored packages: {len(ignored)}"
+            )
+        else:
+            manual_label = str(explicit_count) if explicit_count is not None else "?"
+            auto_label = str(dependency_count) if dependency_count is not None else "?"
+            note_parts = [f"manual {manual_label}", f"auto {auto_label}", f"held {len(ignored)}"]
+            errors = [item for item in (explicit_error, dependency_error) if item]
+            if errors:
+                note_parts.append(" / ".join(errors))
+            lines.append("  Package marks: " + " | ".join(note_parts))
         lines.append(f"  Tracked critical packages outdated: {tracked_outdated}/{len(tracked_rows)}")
 
         lines.append("Kernel:")
@@ -1978,17 +2085,26 @@ class MonitorBackend:
         repo_count = len(state.official_updates) if not state.official_error else None
         aur_count = len(state.aur_updates) if not state.aur_error else None
 
-        if state.official_error or state.aur_error:
-            total_summary = "unknown"
+        if self.supports_aur:
+            if state.official_error or state.aur_error:
+                total_summary = "unknown"
+            else:
+                total_summary = str(len(state.official_updates) + len(state.aur_updates))
         else:
-            total_summary = str(len(state.official_updates) + len(state.aur_updates))
+            total_summary = "unknown" if state.official_error else str(len(state.official_updates))
         sort_label = "size desc" if self.package_sort_mode == "size" else "name asc"
         lines.append(f"Sort: {sort_label} | press s to toggle size/name")
-        lines.append(
-            "Backlog: "
-            + f"{total_summary} total | {repo_count if repo_count is not None else '?'} repo"
-            + f" | {aur_count if aur_count is not None else '?'} AUR"
-        )
+        if self.supports_aur:
+            lines.append(
+                "Backlog: "
+                + f"{total_summary} total | {repo_count if repo_count is not None else '?'} repo"
+                + f" | {aur_count if aur_count is not None else '?'} AUR"
+            )
+        else:
+            lines.append(
+                "Backlog: "
+                + f"{total_summary} total | {repo_count if repo_count is not None else '?'} repo"
+            )
 
         if source == "repo":
             if state.official_error:
