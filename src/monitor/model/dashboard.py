@@ -45,12 +45,12 @@ class DashboardModel:
         backend = self.backend
         collectors = [
             Collector("top_problems", "tier1", "Top Problems", 15, backend.collect_top_problems),
-            Collector("diff_snapshot", "tier1", "Diff Snapshot", 15, backend.collect_diff_snapshot),
-            Collector("uptime", "tier1", "Uptime", 15, backend.collect_uptime),
             Collector("snapshot_health", "tier1", "Privileged Snapshot", 15, backend.collect_snapshot_health),
-            Collector("storage", "tier1", "Storage / Capacity", 20, backend.collect_storage),
             Collector("systemd", "tier1", "Systemd / Service Health", 20, backend.collect_systemd),
             Collector("logs", "tier1", "Logs / Errors", 20, backend.collect_logs),
+            Collector("storage", "tier1", "Storage / Capacity", 20, backend.collect_storage),
+            Collector("diff_snapshot", "tier1", "Diff Snapshot", 15, backend.collect_diff_snapshot),
+            Collector("uptime", "tier1", "Uptime", 15, backend.collect_uptime),
             Collector("memory", "tier2", "Memory / Pressure", 10, backend.collect_memory),
             Collector("cpu", "tier2", "CPU / System Load", 10, backend.collect_cpu),
             Collector("thermal", "tier2", "Thermal / Power", 10, backend.collect_thermal),
@@ -66,7 +66,7 @@ class DashboardModel:
         if backend.package_monitoring_enabled():
             collectors.insert(
                 4,
-                Collector("packages", "tier1", "Kernel / Firmware / NVIDIA", 30, backend.collect_packages),
+                Collector("packages", "tier1", "Priority Packages", 30, backend.collect_packages),
             )
             collectors.append(
                 Collector("pending_updates", "packages", "Official Repo Updates", 60, backend.collect_pending_updates)
@@ -75,7 +75,7 @@ class DashboardModel:
                 collectors.append(Collector("aur_updates", "aur", "AUR Updates", 60, backend.collect_aur_updates))
         if backend.capture_monitoring_enabled():
             collectors.insert(
-                12 if backend.package_monitoring_enabled() else 11,
+                13 if backend.package_monitoring_enabled() else 12,
                 Collector("device_specific", "tier2", "Device-Specific Signals", 30, backend.collect_device_specific),
             )
         return collectors

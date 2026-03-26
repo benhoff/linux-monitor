@@ -244,7 +244,7 @@ class DiffSnapshotService:
                 and current_tracked != previous_tracked
             ):
                 delta = current_tracked - previous_tracked
-                changes.append(f"Tracked critical packages: {delta:+d} outdated ({current_tracked} now)")
+                changes.append(f"Tracked priority packages: {delta:+d} outdated ({current_tracked} now)")
 
         current_storage = current.get("storage", {})
         previous_storage = previous.get("storage", {})
