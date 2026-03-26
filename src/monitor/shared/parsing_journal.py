@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import re
+from collections import OrderedDict
+from typing import Sequence
+
 from monitor.shared.command import CommandResult, run_command
 from monitor.shared.text import line_list, shorten
 from monitor.shared.formatting import single_line
@@ -10,6 +14,46 @@ def journal_line_list(text: str, limit: int | None = None) -> list[str]:
     if limit is not None:
         return lines[:limit]
     return lines
+
+
+def _journal_summary_key(line: str) -> str:
+    normalized = line.strip()
+    normalized = re.sub(
+        r"^\[\s*\d+(?:\.\d+)?\]\s+",
+        "",
+        normalized,
+    )
+    normalized = re.sub(
+        r"^\d{4}-\d{2}-\d{2}(?:T| )\d{2}:\d{2}(?::\d{2})?(?:[.,]\d+)?(?:[+-]\d{2}:\d{2})?\s+",
+        "",
+        normalized,
+    )
+    match = re.match(r"^(?:\S+\s+)?([A-Za-z0-9_.@/-]+)(?:\[\d+\])?:\s*(.*)$", normalized)
+    if match:
+        unit, message = match.groups()
+        if message:
+            return f"{unit}: {message}"
+        return f"{unit}:"
+    return normalized
+
+
+def summarize_journal_entries(entries: Sequence[str], limit: int | None = None) -> list[str]:
+    grouped: OrderedDict[str, int] = OrderedDict()
+    for raw in entries:
+        key = _journal_summary_key(raw)
+        if not key:
+            continue
+        grouped[key] = grouped.get(key, 0) + 1
+
+    summaries: list[str] = []
+    for item, count in grouped.items():
+        summary = shorten(item, 150)
+        if count > 1:
+            summary = f"{summary} showed up {count} times"
+        summaries.append(summary)
+        if limit is not None and len(summaries) >= limit:
+            break
+    return summaries
 
 
 def detect_ro_mounts() -> list[str]:
@@ -30,9 +74,9 @@ def detect_ro_mounts() -> list[str]:
 
 def parse_journal_lines(result: CommandResult, limit: int = 8) -> list[str]:
     if result.stdout:
-        entries = journal_line_list(result.stdout, limit)
+        entries = summarize_journal_entries(journal_line_list(result.stdout), limit)
         if entries:
-            return [shorten(line, 150) for line in entries]
+            return entries
         return ["No matching entries."]
     if result.missing:
         return [f"{result.args[0]} not found."]
