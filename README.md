@@ -130,13 +130,13 @@ sudo python3 monitor_privileged_snapshot.py --output /run/monitor/privileged_sna
 Install the privileged snapshot service and timer:
 
 ```bash
-./install_monitor_privileged.sh
+./scripts/install_monitor_privileged.sh
 ```
 
 Refresh the installed privileged snapshot writer and force a new snapshot:
 
 ```bash
-./refresh_monitor_privileged.sh
+./scripts/refresh_monitor_privileged.sh
 ```
 
 If you installed the helper into `/usr/local/bin`, you can also run:
@@ -153,8 +153,9 @@ MONITOR_PRIVILEGED_SNAPSHOT=/path/to/privileged_snapshot.json python3 monitor_tu
 
 Example systemd unit templates are in:
 
-- `contrib/systemd/monitor-privileged-snapshot.service`
-- `contrib/systemd/monitor-privileged-snapshot.timer`
+- `packaging/systemd/monitor-privileged-snapshot.service`
+- `packaging/systemd/monitor-privileged-snapshot.timer`
 
 The installer writes concrete unit files into `/etc/systemd/system` and prompts for `sudo` automatically.
-It also installs `monitor-privileged-refresh` into `/usr/local/bin` when `refresh_monitor_privileged.sh` is present in the repo.
+It also installs `monitor-privileged-refresh` into `/usr/local/bin` when `scripts/refresh_monitor_privileged.sh` is present in the repo.
+The repo-root `install_monitor_privileged.sh` and `refresh_monitor_privileged.sh` remain as compatibility wrappers.
