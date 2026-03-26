@@ -183,6 +183,16 @@ def format_count(value: int, singular: str, plural: str | None = None) -> str:
     return f"{value} {plural or singular + 's'}"
 
 
+def format_name_list(names: Iterable[str], limit: int = 4) -> str:
+    items = [name for name in dict.fromkeys(name for name in names if name)]
+    if not items:
+        return "(none)"
+    if len(items) <= limit:
+        return ", ".join(items)
+    remainder = len(items) - limit
+    return f"{', '.join(items[:limit])}, +{remainder} more"
+
+
 def parse_size_bytes(text: str) -> int:
     match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([KMGTPE]?i?B)\b", text, re.IGNORECASE)
     if not match:
@@ -414,26 +424,82 @@ def validate_removal_plan(
     names: Iterable[str],
     packages: dict[str, PackageInfo],
     protected_packages: set[str],
+    official_only: bool = True,
 ) -> RemovalPlan | None:
+    error = removal_plan_error(
+        roots,
+        names,
+        packages,
+        protected_packages,
+        official_only=official_only,
+    )
+    if error is not None:
+        return None
     root_names = tuple(dict.fromkeys(name for name in roots if name))
     removal_names = tuple(name for name in names if name)
-    if not root_names or not removal_names:
-        return None
-    if any(root not in removal_names for root in root_names):
-        return None
-    total = 0
-    for name in removal_names:
-        pkg = packages.get(name)
-        if pkg is None or not pkg.official:
-            return None
-        if name in protected_packages or built_in_protected(name):
-            return None
-        total += pkg.installed_size
+    reclaimable_size = sum(packages[name].installed_size for name in removal_names if name in packages)
     return RemovalPlan(
         roots=root_names,
         removal_names=removal_names,
-        reclaimable_size=total,
+        reclaimable_size=reclaimable_size,
     )
+
+
+def removal_plan_error(
+    roots: Iterable[str],
+    names: Iterable[str],
+    packages: dict[str, PackageInfo],
+    protected_packages: set[str],
+    official_only: bool = True,
+) -> str | None:
+    root_names = tuple(dict.fromkeys(name for name in roots if name))
+    removal_names = tuple(name for name in names if name)
+    if not root_names or not removal_names:
+        if not root_names:
+            return "No packages are selected for removal."
+        return (
+            f"pacman returned an empty removal preview for {format_name_list(root_names)}. "
+            "Refresh with r and try again."
+        )
+
+    missing_roots = [root for root in root_names if root not in removal_names]
+    if missing_roots:
+        return (
+            f"pacman preview no longer includes selected root(s): {format_name_list(missing_roots)}. "
+            "The package state likely changed; refresh with r and retry."
+        )
+
+    missing_packages = [name for name in removal_names if name not in packages]
+    if missing_packages:
+        return (
+            f"Removal preview includes package(s) missing from the current snapshot: "
+            f"{format_name_list(missing_packages)}. Refresh with r and retry."
+        )
+
+    foreign_packages: list[str] = []
+    protected_hits: list[str] = []
+    for name in removal_names:
+        pkg = packages.get(name)
+        if pkg is None:
+            continue
+        if official_only and not pkg.official:
+            foreign_packages.append(name)
+        if name in protected_packages or built_in_protected(name):
+            protected_hits.append(name)
+
+    if foreign_packages:
+        return (
+            f"Removal preview includes foreign/AUR package(s): {format_name_list(foreign_packages)}. "
+            "That selection is only allowed from the orphan view."
+        )
+
+    if protected_hits:
+        return (
+            f"Removal preview includes protected package(s): {format_name_list(protected_hits)}. "
+            "Unprotect them first or adjust the selection."
+        )
+
+    return None
 
 
 def validate_preview(
@@ -810,9 +876,12 @@ class PackageCleanupUI:
         self.sort_mode = "reclaim"
         self.main_index = 0
         self.main_offset = 0
+        self.orphan_index = 0
+        self.orphan_offset = 0
         self.protected_index = 0
         self.protected_offset = 0
         self.selected_roots: set[str] = set()
+        self.orphan_deselected: set[str] = set()
         self.detail_root: str | None = None
         self.confirm_plan: RemovalPlan | None = None
 
@@ -865,6 +934,9 @@ class PackageCleanupUI:
                     continue
             elif self.mode == "detail":
                 if not self._handle_detail_key(key):
+                    continue
+            elif self.mode == "orphans":
+                if not self._handle_orphan_key(key):
                     continue
             elif self.mode == "protected":
                 if not self._handle_protected_key(key):
@@ -926,6 +998,8 @@ class PackageCleanupUI:
                 root = candidates[self.main_index].root
                 self.selected_roots.discard(root)
                 self.model.protect_package(root)
+        elif key in (ord("o"), ord("O")):
+            self.mode = "orphans"
         elif key in (ord("p"), ord("P")):
             self.mode = "protected"
         elif key in (ord("x"), ord("X")):
@@ -959,6 +1033,69 @@ class PackageCleanupUI:
             self._open_confirmation(snapshot, [self.detail_root])
         return True
 
+    def _orphan_rows(self, snapshot: RefreshSnapshot) -> list[PackageInfo]:
+        protected = set(self.model.user_protected)
+        rows = [
+            pkg
+            for pkg in snapshot.packages.values()
+            if pkg.install_reason == "dependency"
+            and not pkg.required_by
+            and pkg.name not in protected
+            and not built_in_protected(pkg.name)
+        ]
+        rows.sort(
+            key=lambda item: (
+                0 if item.official else 1,
+                -item.installed_size,
+                item.name,
+            )
+        )
+        return rows
+
+    def _selected_orphan_names(self, rows: list[PackageInfo]) -> list[str]:
+        return [pkg.name for pkg in rows if pkg.name not in self.orphan_deselected]
+
+    def _handle_orphan_key(self, key: int) -> bool:
+        snapshot, _message = self.model.current_snapshot()
+        rows = self._orphan_rows(snapshot)
+        if key in (27, curses.KEY_BACKSPACE, ord("h"), ord("q"), ord("Q")):
+            self.mode = "main"
+            return True
+        if key in (curses.KEY_DOWN, ord("j")):
+            if rows:
+                self.orphan_index = min(self.orphan_index + 1, len(rows) - 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            self.orphan_index = max(self.orphan_index - 1, 0)
+        elif key == curses.KEY_NPAGE:
+            self.orphan_index = min(self.orphan_index + 15, max(len(rows) - 1, 0))
+        elif key == curses.KEY_PPAGE:
+            self.orphan_index = max(self.orphan_index - 15, 0)
+        elif key == curses.KEY_HOME:
+            self.orphan_index = 0
+        elif key == curses.KEY_END:
+            self.orphan_index = max(len(rows) - 1, 0)
+        elif key == ord(" ") and rows:
+            name = rows[self.orphan_index].name
+            if name in self.orphan_deselected:
+                self.orphan_deselected.remove(name)
+            else:
+                self.orphan_deselected.add(name)
+        elif key in (ord("a"), ord("A")):
+            self.orphan_deselected.clear()
+        elif key in (ord("c"), ord("C")):
+            self.orphan_deselected.update(pkg.name for pkg in rows)
+        elif key in (ord("m"), ord("M")) and rows:
+            name = rows[self.orphan_index].name
+            self.orphan_deselected.discard(name)
+            self.model.protect_package(name)
+        elif key in (ord("x"), ord("X")):
+            roots = self._selected_orphan_names(rows)
+            if roots:
+                self._open_confirmation(snapshot, roots, official_only=False)
+            else:
+                self.model.set_message("No orphan packages selected.", ttl=12.0)
+        return True
+
     def _handle_protected_key(self, key: int) -> bool:
         snapshot, _message = self.model.current_snapshot()
         names = self.model.protected_names(snapshot.packages)
@@ -990,18 +1127,25 @@ class PackageCleanupUI:
             self._draw_main(stdscr, snapshot, message, height, width)
         elif self.mode == "detail":
             self._draw_detail(stdscr, snapshot, message, height, width)
+        elif self.mode == "orphans":
+            self._draw_orphans(stdscr, snapshot, message, height, width)
         else:
             self._draw_protected(stdscr, snapshot, message, height, width)
         if self.confirm_plan is not None:
             self._draw_confirmation(stdscr, snapshot, height, width)
         stdscr.refresh()
 
-    def _open_confirmation(self, snapshot: RefreshSnapshot, roots: Iterable[str]) -> None:
+    def _open_confirmation(
+        self,
+        snapshot: RefreshSnapshot,
+        roots: Iterable[str],
+        official_only: bool = True,
+    ) -> None:
         selected_roots = tuple(
             dict.fromkeys(
                 root
                 for root in roots
-                if root and root in snapshot.candidates
+                if root and root in snapshot.packages
             )
         )
         if not selected_roots:
@@ -1017,9 +1161,22 @@ class PackageCleanupUI:
             removal_names,
             snapshot.packages,
             set(self.model.user_protected),
+            official_only=official_only,
         )
         if plan is None:
-            self.model.set_message("Selection is no longer a valid removable set.", ttl=12.0)
+            error = removal_plan_error(
+                selected_roots,
+                removal_names,
+                snapshot.packages,
+                set(self.model.user_protected),
+                official_only=official_only,
+            )
+            if error is None:
+                error = (
+                    f"Selection {format_name_list(selected_roots)} is no longer a valid removable set. "
+                    "Refresh with r and try again."
+                )
+            self.model.set_message(error, ttl=16.0)
             return
         self.confirm_plan = plan
 
@@ -1045,7 +1202,7 @@ class PackageCleanupUI:
 
         title = "Package Cleanup TUI"
         subtitle = "Official installed packages only | unsafe packages hidden | multiselect bulk removal"
-        help_text = "Space mark | x remove marked/current | c clear marks | Enter inspect | m protect | p protected | s sort | r refresh | q quit"
+        help_text = "Space mark | x remove marked/current | c clear marks | o orphans | Enter inspect | m protect | p protected | s sort | r refresh | q quit"
         self._safe_addstr(stdscr, 0, 0, title[: max(width - 1, 1)], curses.color_pair(2) | curses.A_BOLD)
         self._safe_addstr(stdscr, 1, 0, subtitle[: max(width - 1, 1)], curses.A_DIM)
         self._safe_addstr(stdscr, 2, 0, help_text[: max(width - 1, 1)], curses.A_DIM)
@@ -1189,6 +1346,77 @@ class PackageCleanupUI:
             footer = f"{footer} | {message}"
         self._safe_addstr(stdscr, height - 1, 0, footer[: max(width - 1, 1)], curses.color_pair(4))
 
+    def _draw_orphans(
+        self,
+        stdscr: curses.window,
+        snapshot: RefreshSnapshot,
+        message: str,
+        height: int,
+        width: int,
+    ) -> None:
+        rows = self._orphan_rows(snapshot)
+        if self.orphan_index >= len(rows):
+            self.orphan_index = max(len(rows) - 1, 0)
+        body_top = 3
+        body_height = max(height - 5, 1)
+        max_offset = max(len(rows) - body_height, 0)
+        if self.orphan_index < self.orphan_offset:
+            self.orphan_offset = self.orphan_index
+        elif self.orphan_index >= self.orphan_offset + body_height:
+            self.orphan_offset = self.orphan_index - body_height + 1
+        self.orphan_offset = min(self.orphan_offset, max_offset)
+
+        selected_names = self._selected_orphan_names(rows)
+        selected_size = sum(snapshot.packages[name].installed_size for name in selected_names if name in snapshot.packages)
+        title = "Orphan Packages"
+        subtitle = "Dependency-installed packages with no reverse deps. All are selected by default."
+        help_text = "Space unselect/reselect | x remove selected | a select all | c clear all | m protect | q back"
+        self._safe_addstr(stdscr, 0, 0, title[: max(width - 1, 1)], curses.color_pair(2) | curses.A_BOLD)
+        self._safe_addstr(stdscr, 1, 0, subtitle[: max(width - 1, 1)], curses.A_DIM)
+        self._safe_addstr(stdscr, 2, 0, help_text[: max(width - 1, 1)], curses.A_DIM)
+
+        marker_width = 3
+        repo_width = 4
+        name_width = max(min(width // 4, 28), 18)
+        size_width = 10
+        desc_width = max(width - marker_width - repo_width - name_width - size_width - 5, 18)
+        header_attr = curses.color_pair(5) | curses.A_BOLD
+        self._safe_addstr(stdscr, 3, 0, "Sel"[:marker_width], header_attr)
+        self._safe_addstr(stdscr, 3, marker_width + 1, "Repo"[:repo_width], header_attr)
+        self._safe_addstr(stdscr, 3, marker_width + repo_width + 2, "Package"[:name_width], header_attr)
+        size_col = marker_width + repo_width + name_width + 3
+        desc_col = size_col + size_width + 1
+        self._safe_addstr(stdscr, 3, size_col, "Size"[:size_width], header_attr)
+        self._safe_addstr(stdscr, 3, desc_col, "Description"[:desc_width], header_attr)
+
+        body_top = 4
+        body_height = max(height - 6, 1)
+        visible = rows[self.orphan_offset : self.orphan_offset + body_height]
+        for row, pkg in enumerate(visible, start=body_top):
+            selected = rows[self.orphan_index].name == pkg.name if rows else False
+            marker = "[ ]" if pkg.name in self.orphan_deselected else "[x]"
+            repo = "off" if pkg.official else "aur"
+            attr = curses.color_pair(1) | curses.A_BOLD if selected else curses.A_NORMAL
+            self._safe_addstr(stdscr, row, 0, marker[:marker_width], attr)
+            self._safe_addstr(stdscr, row, marker_width + 1, repo[:repo_width], attr)
+            self._safe_addstr(stdscr, row, marker_width + repo_width + 2, pkg.name[: name_width - 1].ljust(name_width), attr)
+            self._safe_addstr(stdscr, row, size_col, format_bytes(pkg.installed_size).rjust(size_width), attr)
+            self._safe_addstr(stdscr, row, desc_col, pkg.description[: desc_width - 1], attr)
+
+        if not rows:
+            self._safe_addstr(stdscr, body_top, 0, "No orphan packages.", curses.A_DIM)
+
+        status_parts = [
+            snapshot.status,
+            format_count(len(rows), "orphan"),
+            f"selected {len(selected_names)}",
+            f"size {format_bytes(selected_size)}",
+        ]
+        footer = " | ".join(status_parts)
+        if message:
+            footer = f"{footer} | {message}"
+        self._safe_addstr(stdscr, height - 1, 0, footer[: max(width - 1, 1)], curses.color_pair(4))
+
     def _draw_protected(
         self,
         stdscr: curses.window,
@@ -1309,6 +1537,7 @@ class PackageCleanupUI:
             pass
         if returncode == 0:
             self.selected_roots.difference_update(plan.roots)
+            self.orphan_deselected.difference_update(plan.roots)
             self.mode = "main"
             self.detail_root = None
             self.model.apply_local_removal(plan)

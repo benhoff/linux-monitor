@@ -49,6 +49,7 @@ Keys:
 - `Enter`: inspect the selected package
 - `x`: remove all marked packages, or the current package when nothing is marked
 - `c`: clear all current marks
+- `o`: open the orphan package view
 - `m`: protect and hide the selected package
 - `p`: open the user-protected package list
 - `s`: cycle sort by reclaimable size, installed size, or name
@@ -61,6 +62,16 @@ Detail view:
 - shows reclaimable installed size and the full removal impact
 - `Space` marks or unmarks the current package without leaving detail view
 - `x` runs `pacman -Rsu --confirm <package>` through the TUI after a final prompt
+
+Orphan view:
+
+- lists dependency-installed packages with no reverse dependencies
+- auto-selects all visible orphan packages by default
+- `Space` toggles the current orphan on or off
+- `a` reselects all current orphans
+- `c` clears the current orphan selection
+- `x` runs a bulk uninstall for the currently selected orphan set
+- `m` protects and hides the current orphan package
 
 Protected view:
 
