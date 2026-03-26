@@ -370,10 +370,10 @@ class CaptureCollector:
 
     def collect(self) -> list[str]:
         lines = ["Capture pipeline:"]
-        cards = self.backend.cached("capture_cards", 30.0, self.capture_cards)
-        modules = self.backend.cached("capture_modules", 10.0, self.capture_modules)
-        driver_params = self.backend.cached("capture_driver_params", 30.0, self.capture_driver_params)
-        v4l2_inventory = self.backend.cached("v4l2_inventory", 20.0, self.v4l2_inventory)
+        cards = self.backend.cached("capture_cards", 60.0, self.capture_cards)
+        modules = self.backend.cached("capture_modules", 30.0, self.capture_modules)
+        driver_params = self.backend.cached("capture_driver_params", 60.0, self.capture_driver_params)
+        v4l2_inventory = self.backend.cached("v4l2_inventory", 30.0, self.v4l2_inventory)
         encoders = self.backend.cached("encoder_availability", 600.0, self.encoder_availability)
         connectors = self.drm_connectors()
         log_hints = self.capture_log_hints()
@@ -391,7 +391,7 @@ class CaptureCollector:
         capture_clients = (
             self.backend.cached(
                 "capture_clients:" + ",".join(capture_video_nodes),
-                10.0,
+                30.0,
                 lambda: self.capture_clients(capture_video_nodes),
             )
             if capture_video_nodes

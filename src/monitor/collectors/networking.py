@@ -293,7 +293,7 @@ class BluetoothCollector:
         }
 
     def state(self) -> dict[str, object]:
-        live = self.backend.cached("bluetooth_live_state", 15.0, self.live_state)
+        live = self.backend.cached("bluetooth_live_state", 30.0, self.live_state)
         if isinstance(live, dict):
             return live
         return {}
@@ -492,7 +492,7 @@ class WifiCollector:
         return parse_journal_lines(result, limit=6)
 
     def live_state(self) -> dict[str, object]:
-        quality = self.backend.cached("proc_net_wireless", 5.0, self.proc_net_wireless)
+        quality = self.backend.cached("proc_net_wireless", 30.0, self.proc_net_wireless)
         interfaces: list[dict[str, object]] = []
         for name in self.wireless_interfaces():
             sysfs = Path("/sys/class/net") / name
@@ -554,7 +554,7 @@ class WifiCollector:
         privileged = self.backend._privileged_section("wifi")
         if privileged:
             return privileged
-        live = self.backend.cached("wifi_live_state", 10.0, self.live_state)
+        live = self.backend.cached("wifi_live_state", 30.0, self.live_state)
         if isinstance(live, dict):
             return live
         return {}

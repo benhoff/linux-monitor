@@ -51,14 +51,14 @@ class DashboardModel:
             Collector("storage", "tier1", "Storage / Capacity", 20, backend.collect_storage),
             Collector("systemd", "tier1", "Systemd / Service Health", 20, backend.collect_systemd),
             Collector("logs", "tier1", "Logs / Errors", 20, backend.collect_logs),
-            Collector("memory", "tier2", "Memory / Pressure", 5, backend.collect_memory),
-            Collector("cpu", "tier2", "CPU / System Load", 4, backend.collect_cpu),
-            Collector("thermal", "tier2", "Thermal / Power", 6, backend.collect_thermal),
+            Collector("memory", "tier2", "Memory / Pressure", 10, backend.collect_memory),
+            Collector("cpu", "tier2", "CPU / System Load", 10, backend.collect_cpu),
+            Collector("thermal", "tier2", "Thermal / Power", 10, backend.collect_thermal),
             Collector("hardware", "tier2", "Hardware Health", 30, backend.collect_hardware),
             Collector("fs_integrity", "tier2", "Filesystem Integrity", 30, backend.collect_fs_integrity),
-            Collector("network", "tier3", "Network State", 15, backend.collect_network),
-            Collector("wifi", "tier3", "Wi-Fi Intelligence", 15, backend.collect_wifi),
-            Collector("bluetooth", "tier3", "Bluetooth", 20, backend.collect_bluetooth),
+            Collector("network", "tier3", "Network State", 30, backend.collect_network),
+            Collector("wifi", "tier3", "Wi-Fi Intelligence", 30, backend.collect_wifi),
+            Collector("bluetooth", "tier3", "Bluetooth", 30, backend.collect_bluetooth),
             Collector("security", "tier3", "Security / Exposure Surface", 30, backend.collect_security),
             Collector("hygiene", "tier3", "System Hygiene", 300, backend.collect_hygiene),
             Collector("boot", "tier3", "Boot / Regression Signals", 300, backend.collect_boot),
@@ -76,7 +76,7 @@ class DashboardModel:
         if backend.capture_monitoring_enabled():
             collectors.insert(
                 12 if backend.package_monitoring_enabled() else 11,
-                Collector("device_specific", "tier2", "Device-Specific Signals", 20, backend.collect_device_specific),
+                Collector("device_specific", "tier2", "Device-Specific Signals", 30, backend.collect_device_specific),
             )
         return collectors
 
