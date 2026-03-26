@@ -16,7 +16,7 @@ import tempfile
 import textwrap
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -113,6 +113,13 @@ class PackageInfo:
 @dataclass(frozen=True)
 class CandidatePreview:
     root: str
+    removal_names: tuple[str, ...]
+    reclaimable_size: int
+
+
+@dataclass(frozen=True)
+class RemovalPlan:
+    roots: tuple[str, ...]
     removal_names: tuple[str, ...]
     reclaimable_size: int
 
@@ -349,6 +356,11 @@ def resolve_dependency_names(packages: dict[str, PackageInfo]) -> None:
         pkg.resolved_dep_names = resolved
 
 
+def inventory_fingerprint(packages: dict[str, PackageInfo]) -> str:
+    lines = [f"{pkg.name}\t{pkg.version}" for pkg in packages.values()]
+    return hashlib.sha256("\n".join(sorted(lines)).encode("utf-8")).hexdigest()
+
+
 def load_package_inventory() -> tuple[dict[str, PackageInfo], str]:
     info_result = run_command(["pacman", "-Qi"], timeout=60.0)
     if not info_result.ok:
@@ -375,27 +387,39 @@ def load_package_inventory() -> tuple[dict[str, PackageInfo], str]:
     return packages, fingerprint
 
 
-def removal_preview(root: str) -> tuple[str, ...]:
+def removal_preview(roots: str | Iterable[str]) -> tuple[str, ...]:
+    if isinstance(roots, str):
+        root_names = [roots]
+    else:
+        root_names = [name for name in roots if name]
+    if not root_names:
+        raise RuntimeError("No package roots selected.")
+    root_names = list(dict.fromkeys(root_names))
     result = run_command(
-        ["pacman", "-Rsup", "--print-format", "%n", root],
+        ["pacman", "-Rsup", "--print-format", "%n", *root_names],
         timeout=20.0,
     )
     if not result.ok:
-        raise RuntimeError(single_line(result.stderr or f"Failed to preview {root}"))
+        roots_text = ", ".join(root_names)
+        raise RuntimeError(single_line(result.stderr or f"Failed to preview {roots_text}"))
     names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if root not in names:
-        names.insert(0, root)
+    for root in reversed(root_names):
+        if root not in names:
+            names.insert(0, root)
     return tuple(dict.fromkeys(names))
 
 
-def validate_preview(
-    root: str,
+def validate_removal_plan(
+    roots: Iterable[str],
     names: Iterable[str],
     packages: dict[str, PackageInfo],
     protected_packages: set[str],
-) -> CandidatePreview | None:
+) -> RemovalPlan | None:
+    root_names = tuple(dict.fromkeys(name for name in roots if name))
     removal_names = tuple(name for name in names if name)
-    if not removal_names or root not in removal_names:
+    if not root_names or not removal_names:
+        return None
+    if any(root not in removal_names for root in root_names):
         return None
     total = 0
     for name in removal_names:
@@ -405,7 +429,23 @@ def validate_preview(
         if name in protected_packages or built_in_protected(name):
             return None
         total += pkg.installed_size
-    return CandidatePreview(root=root, removal_names=removal_names, reclaimable_size=total)
+    return RemovalPlan(
+        roots=root_names,
+        removal_names=removal_names,
+        reclaimable_size=total,
+    )
+
+
+def validate_preview(
+    root: str,
+    names: Iterable[str],
+    packages: dict[str, PackageInfo],
+    protected_packages: set[str],
+) -> CandidatePreview | None:
+    plan = validate_removal_plan((root,), names, packages, protected_packages)
+    if plan is None:
+        return None
+    return CandidatePreview(root=root, removal_names=plan.removal_names, reclaimable_size=plan.reclaimable_size)
 
 
 def preview_tree_lines(
@@ -459,10 +499,15 @@ def preview_tree_lines(
     return lines or [preview.root[:width]]
 
 
-def shell_command_for_removal(root: str) -> list[str]:
+def shell_command_for_removal(roots: str | Iterable[str]) -> list[str]:
+    if isinstance(roots, str):
+        root_names = [roots]
+    else:
+        root_names = [name for name in roots if name]
+    root_names = list(dict.fromkeys(root_names))
     if os.geteuid() == 0:
-        return ["pacman", "-Rsu", "--confirm", root]
-    return ["sudo", "pacman", "-Rsu", "--confirm", root]
+        return ["pacman", "-Rsu", "--confirm", *root_names]
+    return ["sudo", "pacman", "-Rsu", "--confirm", *root_names]
 
 
 class PackageCleanupModel:
@@ -493,6 +538,9 @@ class PackageCleanupModel:
         self.snapshot = RefreshSnapshot()
         self.message = ""
         self.message_until = 0.0
+        self.pending_packages: dict[str, PackageInfo] | None = None
+        self.pending_fingerprint = ""
+        self.pending_status = ""
         self.refresh_requested = threading.Event()
         self.stop_event = threading.Event()
         self.worker = threading.Thread(target=self._refresh_loop, daemon=True)
@@ -509,6 +557,10 @@ class PackageCleanupModel:
     def request_refresh(self, message: str | None = None) -> None:
         if message:
             self.set_message(message)
+        with self.lock:
+            self.pending_packages = None
+            self.pending_fingerprint = ""
+            self.pending_status = ""
         self.refresh_requested.set()
 
     def set_message(self, message: str, ttl: float = MESSAGE_TTL_SECONDS) -> None:
@@ -558,6 +610,112 @@ class PackageCleanupModel:
     def protected_names(self, packages: dict[str, PackageInfo]) -> list[str]:
         return sorted(name for name in self.user_protected if name in packages or name)
 
+    def _queue_rebuild(
+        self,
+        packages: dict[str, PackageInfo],
+        fingerprint: str,
+        status: str,
+    ) -> None:
+        with self.lock:
+            self.pending_packages = packages
+            self.pending_fingerprint = fingerprint
+            self.pending_status = status
+        self.refresh_requested.set()
+
+    def _prepare_cached_candidates(
+        self,
+        packages: dict[str, PackageInfo],
+        fingerprint: str,
+    ) -> tuple[set[str], list[str], dict[str, CandidatePreview], list[str], int, bool]:
+        protected = set(self.user_protected)
+        roots = sorted(
+            pkg.name
+            for pkg in packages.values()
+            if pkg.official
+            and not pkg.required_by
+            and pkg.name not in protected
+            and not built_in_protected(pkg.name)
+        )
+        valid_candidates: dict[str, CandidatePreview] = {}
+        cached_missing: list[str] = []
+        validated = 0
+        save_needed = False
+        allowed_roots = set(roots)
+
+        for name in list(self.preview_cache):
+            if name not in allowed_roots:
+                self.preview_cache.pop(name, None)
+                save_needed = True
+
+        for root in roots:
+            cached = self.preview_cache.get(root)
+            if cached is None:
+                cached_missing.append(root)
+                continue
+            candidate = validate_preview(root, cached.removal_names, packages, protected)
+            if candidate is None:
+                self.preview_cache.pop(root, None)
+                cached_missing.append(root)
+                save_needed = True
+                continue
+            validated += 1
+            valid_candidates[root] = candidate
+            if candidate != cached:
+                self.preview_cache[root] = candidate
+                save_needed = True
+
+        self.cached_fingerprint = fingerprint
+        return protected, roots, valid_candidates, cached_missing, validated, save_needed
+
+    def apply_local_removal(self, plan: RemovalPlan) -> None:
+        with self.lock:
+            current_packages = dict(self.snapshot.packages)
+        if not current_packages:
+            self.request_refresh(
+                f"Removed {format_count(len(plan.roots), 'root package')}. Refreshing package catalog..."
+            )
+            return
+
+        removed = set(plan.removal_names)
+        remaining_packages = {
+            name: replace(pkg)
+            for name, pkg in current_packages.items()
+            if name not in removed
+        }
+        for name, pkg in list(remaining_packages.items()):
+            pkg.required_by = [dep for dep in pkg.required_by if dep not in removed]
+            pkg.resolved_dep_names = [dep for dep in pkg.resolved_dep_names if dep not in removed]
+            remaining_packages[name] = pkg
+        resolve_dependency_names(remaining_packages)
+        fingerprint = inventory_fingerprint(remaining_packages)
+
+        _protected, roots, valid_candidates, cached_missing, validated, save_needed = self._prepare_cached_candidates(
+            remaining_packages,
+            fingerprint,
+        )
+
+        if cached_missing:
+            status = f"Validated {validated}/{len(roots)} removable roots..."
+        else:
+            status = f"Loaded {len(valid_candidates)} removable candidates."
+        with self.lock:
+            self.snapshot.packages = remaining_packages
+            self.snapshot.fingerprint = fingerprint
+            self.snapshot.roots_total = len(roots)
+            self.snapshot.validated_count = validated
+            self.snapshot.candidates = dict(valid_candidates)
+            self.snapshot.loading = bool(cached_missing)
+            self.snapshot.status = status
+
+        removed_roots = format_count(len(plan.roots), "root package")
+        if cached_missing:
+            self.set_message(f"Removed {removed_roots}. Updating cached candidates...")
+            self._queue_rebuild(remaining_packages, fingerprint, status)
+        else:
+            self.set_message(f"Removed {removed_roots}.")
+        if save_needed or not cached_missing:
+            self._save_cache()
+
     def _refresh_loop(self) -> None:
         while not self.stop_event.is_set():
             self.refresh_requested.wait()
@@ -568,57 +726,32 @@ class PackageCleanupModel:
 
     def _refresh_once(self) -> None:
         with self.lock:
+            packages = self.pending_packages
+            fingerprint = self.pending_fingerprint
+            status = self.pending_status
+            self.pending_packages = None
+            self.pending_fingerprint = ""
+            self.pending_status = ""
             self.snapshot.loading = True
-            self.snapshot.status = "Loading pacman metadata..."
-            self.snapshot.candidates = {}
-            self.snapshot.validated_count = 0
-            self.snapshot.roots_total = 0
-        try:
-            packages, fingerprint = load_package_inventory()
-        except RuntimeError as exc:
-            with self.lock:
-                self.snapshot.loading = False
-                self.snapshot.status = str(exc)
-                self.snapshot.packages = {}
-                self.snapshot.candidates = {}
-                self.snapshot.fingerprint = ""
-            self.set_message(str(exc), ttl=15.0)
-            return
+            self.snapshot.status = status or "Loading pacman metadata..."
+        if packages is None:
+            try:
+                packages, fingerprint = load_package_inventory()
+            except RuntimeError as exc:
+                with self.lock:
+                    self.snapshot.loading = False
+                    self.snapshot.status = str(exc)
+                self.set_message(str(exc), ttl=15.0)
+                return
 
-        protected = set(self.user_protected)
-        roots = sorted(
-            pkg.name
-            for pkg in packages.values()
-            if pkg.official
-            and not pkg.required_by
-            and pkg.name not in protected
-            and not built_in_protected(pkg.name)
+        protected, roots, valid_candidates, cached_missing, validated, save_needed = self._prepare_cached_candidates(
+            packages,
+            fingerprint,
         )
         with self.lock:
             self.snapshot.packages = packages
             self.snapshot.fingerprint = fingerprint
             self.snapshot.roots_total = len(roots)
-            self.snapshot.status = f"Validating {len(roots)} removable roots..."
-
-        if fingerprint != self.cached_fingerprint:
-            self.preview_cache = {}
-            self.cached_fingerprint = fingerprint
-
-        valid_candidates: dict[str, CandidatePreview] = {}
-        cached_missing: list[str] = []
-        validated = 0
-        for root in roots:
-            cached = self.preview_cache.get(root)
-            if cached is None:
-                cached_missing.append(root)
-                continue
-            validated += 1
-            candidate = validate_preview(root, cached.removal_names, packages, protected)
-            if candidate is None:
-                continue
-            valid_candidates[root] = candidate
-
-        with self.lock:
             self.snapshot.candidates = dict(valid_candidates)
             self.snapshot.validated_count = validated
             self.snapshot.status = f"Validated {validated}/{len(roots)} removable roots..."
@@ -636,7 +769,7 @@ class PackageCleanupModel:
             except RuntimeError as exc:
                 return root, None, str(exc)
 
-        save_needed = False
+        cache_dirty = save_needed
         with concurrent.futures.ThreadPoolExecutor(max_workers=PREVIEW_WORKERS) as executor:
             futures = {executor.submit(task, root): root for root in cached_missing}
             for future in concurrent.futures.as_completed(futures):
@@ -645,16 +778,13 @@ class PackageCleanupModel:
                 root, removal_names, error = future.result()
                 validated += 1
                 if removal_names is not None:
-                    self.preview_cache[root] = CandidatePreview(
-                        root=root,
-                        removal_names=removal_names,
-                        reclaimable_size=0,
-                    )
-                    save_needed = True
+                    cache_dirty = True
                     candidate = validate_preview(root, removal_names, packages, protected)
                     if candidate is not None:
                         valid_candidates[root] = candidate
                         self.preview_cache[root] = candidate
+                    else:
+                        self.preview_cache.pop(root, None)
                 elif error:
                     self.set_message(error)
                 with self.lock:
@@ -669,7 +799,7 @@ class PackageCleanupModel:
             self.snapshot.validated_count = validated
             self.snapshot.loading = False
             self.snapshot.status = f"Loaded {len(valid_candidates)} removable candidates."
-        if save_needed or cached_missing:
+        if cache_dirty or cached_missing:
             self._save_cache()
 
 
@@ -682,8 +812,9 @@ class PackageCleanupUI:
         self.main_offset = 0
         self.protected_index = 0
         self.protected_offset = 0
+        self.selected_roots: set[str] = set()
         self.detail_root: str | None = None
-        self.confirm_remove = False
+        self.confirm_plan: RemovalPlan | None = None
 
     def run(self) -> None:
         curses.wrapper(self._main)
@@ -714,11 +845,11 @@ class PackageCleanupUI:
             if key == -1:
                 time.sleep(REFRESH_POLL_INTERVAL)
                 continue
-            if self.confirm_remove:
+            if self.confirm_plan is not None:
                 if key in (ord("y"), ord("Y")):
                     self._perform_removal(stdscr)
                 elif key in (ord("n"), ord("N"), 27):
-                    self.confirm_remove = False
+                    self.confirm_plan = None
                 continue
             if key in (ord("q"), ord("Q")):
                 if self.mode == "main":
@@ -775,6 +906,15 @@ class PackageCleanupUI:
             if candidates:
                 self.detail_root = candidates[self.main_index].root
                 self.mode = "detail"
+        elif key == ord(" "):
+            if candidates:
+                root = candidates[self.main_index].root
+                if root in self.selected_roots:
+                    self.selected_roots.remove(root)
+                else:
+                    self.selected_roots.add(root)
+        elif key in (ord("c"), ord("C")):
+            self.selected_roots.clear()
         elif key in (ord("s"), ord("S")):
             self.sort_mode = {
                 "reclaim": "size",
@@ -783,9 +923,17 @@ class PackageCleanupUI:
             }[self.sort_mode]
         elif key in (ord("m"), ord("M")):
             if candidates:
-                self.model.protect_package(candidates[self.main_index].root)
+                root = candidates[self.main_index].root
+                self.selected_roots.discard(root)
+                self.model.protect_package(root)
         elif key in (ord("p"), ord("P")):
             self.mode = "protected"
+        elif key in (ord("x"), ord("X")):
+            roots = [root for root in self.selected_roots if root in snapshot.candidates]
+            if not roots and candidates:
+                roots = [candidates[self.main_index].root]
+            if roots:
+                self._open_confirmation(snapshot, roots)
         return True
 
     def _handle_detail_key(self, key: int) -> bool:
@@ -797,12 +945,18 @@ class PackageCleanupUI:
         if key in (27, curses.KEY_BACKSPACE, ord("h")):
             self.mode = "main"
             self.detail_root = None
+        elif key == ord(" ") and self.detail_root:
+            if self.detail_root in self.selected_roots:
+                self.selected_roots.remove(self.detail_root)
+            else:
+                self.selected_roots.add(self.detail_root)
         elif key in (ord("m"), ord("M")) and self.detail_root:
+            self.selected_roots.discard(self.detail_root)
             self.model.protect_package(self.detail_root)
             self.mode = "main"
             self.detail_root = None
         elif key in (ord("x"), ord("X")):
-            self.confirm_remove = True
+            self._open_confirmation(snapshot, [self.detail_root])
         return True
 
     def _handle_protected_key(self, key: int) -> bool:
@@ -838,9 +992,36 @@ class PackageCleanupUI:
             self._draw_detail(stdscr, snapshot, message, height, width)
         else:
             self._draw_protected(stdscr, snapshot, message, height, width)
-        if self.confirm_remove:
+        if self.confirm_plan is not None:
             self._draw_confirmation(stdscr, snapshot, height, width)
         stdscr.refresh()
+
+    def _open_confirmation(self, snapshot: RefreshSnapshot, roots: Iterable[str]) -> None:
+        selected_roots = tuple(
+            dict.fromkeys(
+                root
+                for root in roots
+                if root and root in snapshot.candidates
+            )
+        )
+        if not selected_roots:
+            self.model.set_message("No removable packages selected.")
+            return
+        try:
+            removal_names = removal_preview(selected_roots)
+        except RuntimeError as exc:
+            self.model.set_message(str(exc), ttl=12.0)
+            return
+        plan = validate_removal_plan(
+            selected_roots,
+            removal_names,
+            snapshot.packages,
+            set(self.model.user_protected),
+        )
+        if plan is None:
+            self.model.set_message("Selection is no longer a valid removable set.", ttl=12.0)
+            return
+        self.confirm_plan = plan
 
     def _draw_main(
         self,
@@ -863,12 +1044,13 @@ class PackageCleanupUI:
         self.main_offset = min(self.main_offset, max_offset)
 
         title = "Package Cleanup TUI"
-        subtitle = "Official installed packages only | unsafe packages hidden | single-package removal"
-        help_text = "Enter inspect | m protect/hide | p protected list | s sort | r refresh | q quit"
+        subtitle = "Official installed packages only | unsafe packages hidden | multiselect bulk removal"
+        help_text = "Space mark | x remove marked/current | c clear marks | Enter inspect | m protect | p protected | s sort | r refresh | q quit"
         self._safe_addstr(stdscr, 0, 0, title[: max(width - 1, 1)], curses.color_pair(2) | curses.A_BOLD)
         self._safe_addstr(stdscr, 1, 0, subtitle[: max(width - 1, 1)], curses.A_DIM)
         self._safe_addstr(stdscr, 2, 0, help_text[: max(width - 1, 1)], curses.A_DIM)
 
+        marker_width = 3
         name_width = max(min(width // 4, 28), 18)
         size_width = 0
         size_label = ""
@@ -878,14 +1060,15 @@ class PackageCleanupUI:
         elif self.sort_mode == "reclaim":
             size_width = 10
             size_label = "Reclaim"
-        desc_width = max(width - name_width - size_width - (2 if size_width else 1), 20)
+        desc_width = max(width - marker_width - name_width - size_width - (3 if size_width else 2), 20)
         header_attr = curses.color_pair(5) | curses.A_BOLD
-        self._safe_addstr(stdscr, 3, 0, "Package"[:name_width], header_attr)
-        size_col = name_width + 1
-        desc_col = name_width + 1
+        self._safe_addstr(stdscr, 3, 0, "Sel"[:marker_width], header_attr)
+        self._safe_addstr(stdscr, 3, marker_width + 1, "Package"[:name_width], header_attr)
+        size_col = marker_width + name_width + 2
+        desc_col = marker_width + name_width + 2
         if size_width:
             self._safe_addstr(stdscr, 3, size_col, size_label[:size_width], header_attr)
-            desc_col = name_width + size_width + 2
+            desc_col = marker_width + name_width + size_width + 3
         self._safe_addstr(stdscr, 3, desc_col, "Description"[:desc_width], header_attr)
         body_top = 4
         body_height = max(height - 6, 1)
@@ -893,10 +1076,12 @@ class PackageCleanupUI:
         for row, preview in enumerate(visible, start=body_top):
             selected = candidates[self.main_index].root == preview.root if candidates else False
             pkg = snapshot.packages.get(preview.root)
+            marker = "[x]" if preview.root in self.selected_roots else "[ ]"
             name = preview.root[: name_width - 1]
             desc = (pkg.description if pkg else "")[: desc_width - 1]
             attr = curses.color_pair(1) | curses.A_BOLD if selected else curses.A_NORMAL
-            self._safe_addstr(stdscr, row, 0, name.ljust(name_width), attr)
+            self._safe_addstr(stdscr, row, 0, marker[:marker_width], attr)
+            self._safe_addstr(stdscr, row, marker_width + 1, name.ljust(name_width), attr)
             if size_width:
                 size_value = ""
                 if self.sort_mode == "size" and pkg is not None:
@@ -910,6 +1095,7 @@ class PackageCleanupUI:
             snapshot.status,
             f"sort {self.sort_mode}",
             format_count(len(candidates), "candidate"),
+            f"selected {len(self.selected_roots)}",
             f"protected {len(self.model.user_protected)}",
         ]
         if candidates:
@@ -943,12 +1129,14 @@ class PackageCleanupUI:
         center_width = max(width - left_width - right_width - 2, 20)
 
         title = f"Inspect {preview.root}"
-        help_text = "x remove | m protect/hide | Esc back | removal uses pacman with confirmation"
+        marked = "yes" if preview.root in self.selected_roots else "no"
+        help_text = "Space mark | x remove current | m protect/hide | Esc back | removal uses pacman with confirmation"
         self._safe_addstr(stdscr, 0, 0, title[: max(width - 1, 1)], curses.color_pair(2) | curses.A_BOLD)
         self._safe_addstr(stdscr, 1, 0, help_text[: max(width - 1, 1)], curses.A_DIM)
 
         left_lines = [
             f"Package: {preview.root}",
+            f"Marked: {marked}",
             f"Version: {pkg.version if pkg else '?'}",
             f"Installed size: {format_bytes(pkg.installed_size) if pkg else '?'}",
             f"Reclaimable: {format_bytes(preview.reclaimable_size)}",
@@ -1066,21 +1254,23 @@ class PackageCleanupUI:
         height: int,
         width: int,
     ) -> None:
-        if self.detail_root is None or self.detail_root not in snapshot.candidates:
-            self.confirm_remove = False
+        if self.confirm_plan is None:
             return
-        preview = snapshot.candidates[self.detail_root]
+        roots = ", ".join(self.confirm_plan.roots[:3])
+        if len(self.confirm_plan.roots) > 3:
+            roots = f"{roots}, ..."
         box_width = min(max(width - 8, 30), 70)
-        box_height = 8
+        box_height = 9
         top = max((height - box_height) // 2, 0)
         left = max((width - box_width) // 2, 0)
         for row in range(box_height):
             self._safe_addstr(stdscr, top + row, left, " " * box_width, curses.color_pair(6) | curses.A_BOLD)
         lines = [
             "Confirm removal",
-            f"Root package: {preview.root}",
-            f"Packages removed: {len(preview.removal_names)}",
-            f"Reclaimable size: {format_bytes(preview.reclaimable_size)}",
+            f"Selected roots: {len(self.confirm_plan.roots)}",
+            f"Roots: {roots}",
+            f"Packages removed: {len(self.confirm_plan.removal_names)}",
+            f"Reclaimable size: {format_bytes(self.confirm_plan.reclaimable_size)}",
             "Press y to run pacman, n to cancel.",
         ]
         for offset, line in enumerate(lines, start=1):
@@ -1093,13 +1283,11 @@ class PackageCleanupUI:
             )
 
     def _perform_removal(self, stdscr: curses.window) -> None:
-        snapshot, _message = self.model.current_snapshot()
-        if self.detail_root is None or self.detail_root not in snapshot.candidates:
-            self.confirm_remove = False
+        plan = self.confirm_plan
+        if plan is None:
             return
-        root = self.detail_root
-        command = shell_command_for_removal(root)
-        self.confirm_remove = False
+        command = shell_command_for_removal(plan.roots)
+        self.confirm_plan = None
         curses.def_prog_mode()
         curses.endwin()
         print(f"Running: {' '.join(shlex.quote(part) for part in command)}")
@@ -1120,9 +1308,10 @@ class PackageCleanupUI:
         except curses.error:
             pass
         if returncode == 0:
+            self.selected_roots.difference_update(plan.roots)
             self.mode = "main"
             self.detail_root = None
-            self.model.request_refresh(f"Removed {root}. Refreshing package catalog...")
+            self.model.apply_local_removal(plan)
         else:
             self.model.set_message(f"Removal exited with code {returncode}.", ttl=12.0)
 

@@ -38,13 +38,17 @@ python3 package_cleanup_tui.py
 Main view:
 
 - shows only removable official packages
+- supports marking multiple roots for bulk removal
 - keeps the main list to package name and description
 - validates candidates in the background using pacman removal previews
 
 Keys:
 
 - `Up` / `Down`: move through the candidate list
+- `Space`: mark or unmark the current package
 - `Enter`: inspect the selected package
+- `x`: remove all marked packages, or the current package when nothing is marked
+- `c`: clear all current marks
 - `m`: protect and hide the selected package
 - `p`: open the user-protected package list
 - `s`: cycle sort by reclaimable size, installed size, or name
@@ -55,6 +59,7 @@ Detail view:
 
 - shows a bounded removal tree for the selected package
 - shows reclaimable installed size and the full removal impact
+- `Space` marks or unmarks the current package without leaving detail view
 - `x` runs `pacman -Rsu --confirm <package>` through the TUI after a final prompt
 
 Protected view:
@@ -65,6 +70,7 @@ Protected view:
 State:
 
 - user-protected packages and removal preview cache are stored in `~/.local/state/monitor/package_cleanup_state.json` unless `XDG_STATE_HOME` is set
+- successful removals update the cached package inventory incrementally and only revalidate impacted/new roots instead of forcing a full catalog reload
 
 ## Colors
 
