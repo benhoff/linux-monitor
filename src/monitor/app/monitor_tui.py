@@ -52,6 +52,8 @@ from monitor.shared.parsing_network import (
 from monitor.shared.paths import diff_snapshot_state_path, legacy_repo_diff_snapshot_path
 from monitor.shared.text import line_list, parse_float, parse_int, read_lines, read_text, shorten
 from monitor.collectors.storage import StorageCollector
+from monitor.collectors.logs import LogsCollector
+from monitor.collectors.systemd_health import SystemdHealthCollector
 from monitor.snapshot.diff_snapshot import DiffSnapshotService
 from monitor.snapshot.privileged import PrivilegedSnapshotService
 
@@ -214,7 +216,9 @@ class MonitorBackend:
         self.package_worker_started = False
         sort_mode = os.environ.get("MONITOR_PACKAGE_SORT", "size").strip().lower()
         self.package_sort_mode = sort_mode if sort_mode in {"size", "name"} else "size"
+        self.logs = LogsCollector(self)
         self.storage = StorageCollector(self)
+        self.systemd_health = SystemdHealthCollector(self)
         self.privileged_snapshots = PrivilegedSnapshotService(self)
         self.diff_snapshots = DiffSnapshotService(self, self.privileged_snapshots)
 
@@ -1305,158 +1309,22 @@ class MonitorBackend:
         return self.storage.collect()
 
     def _systemd_state(self) -> str:
-        result = run_command(["systemctl", "is-system-running"], timeout=3.0)
-        if result.stdout:
-            return result.stdout.splitlines()[0]
-        if result.missing:
-            return "systemctl not found"
-        if result.stderr:
-            return shorten(result.stderr, 120)
-        return "unknown"
+        return self.systemd_health.systemd_state()
 
     def _failed_services(self) -> list[str]:
-        result = run_command(
-            ["systemctl", "--failed", "--type=service", "--no-legend", "--no-pager"],
-            timeout=5.0,
-        )
-        return line_list(result.stdout)
+        return self.systemd_health.failed_services()
 
     def _restart_hints(self) -> list[str]:
-        result = run_command(
-            [
-                "journalctl",
-                "-b",
-                "--grep=Scheduled restart job|Start request repeated too quickly",
-                "-n",
-                "8",
-                "--no-pager",
-            ],
-            timeout=5.0,
-        )
-        return journal_line_list(result.stdout)
+        return self.systemd_health.restart_hints()
 
     def _service_count(self, state: str) -> tuple[int | None, str | None]:
-        return self.count_command_lines(
-            ["systemctl", "list-unit-files", "--type=service", f"--state={state}", "--no-legend", "--no-pager"],
-            timeout=5.0,
-        )
+        return self.systemd_health.service_count(state)
 
     def collect_systemd(self) -> list[str]:
-        privileged = self._privileged_section("systemd")
-        if privileged:
-            lines = []
-            snapshot_line = self._privileged_snapshot_line()
-            if snapshot_line:
-                lines.append(snapshot_line)
-            failed = privileged.get("failed_services", [])
-            restart_hints = privileged.get("restart_hints", [])
-            lines.append(f"System state: {privileged.get('state', 'unknown')}")
-            lines.append(f"Failed services: {len(failed) if isinstance(failed, list) else 0}")
-            if isinstance(failed, list):
-                for item in failed[:6]:
-                    lines.append(f"  {shorten(str(item), 140)}")
-            enabled_count = privileged.get("enabled_count", "n/a")
-            disabled_count = privileged.get("disabled_count", "n/a")
-            lines.append(f"Service unit files: {enabled_count} enabled | {disabled_count} disabled")
-            if isinstance(restart_hints, list) and restart_hints:
-                lines.append("Restart loops / flapping hints:")
-                for item in restart_hints[:4]:
-                    lines.append(f"  {shorten(str(item), 140)}")
-            else:
-                lines.append("Restart loops / flapping hints: none in current boot journal.")
-            return lines
-
-        lines: list[str] = []
-        state = self._systemd_state()
-        failed = self._failed_services()
-        enabled_count, enabled_error = self.cached(
-            "systemd_enabled_count", 600.0, lambda: self._service_count("enabled")
-        )
-        disabled_count, disabled_error = self.cached(
-            "systemd_disabled_count", 600.0, lambda: self._service_count("disabled")
-        )
-        restart_hints = self._restart_hints()
-
-        lines.append(f"System state: {state}")
-        lines.append(f"Failed services: {len(failed)}")
-        for item in failed[:6]:
-            lines.append(f"  {shorten(item, 140)}")
-
-        enabled_display = str(enabled_count) if enabled_count is not None else "n/a"
-        disabled_display = str(disabled_count) if disabled_count is not None else "n/a"
-        note = ", ".join(note for note in (enabled_error, disabled_error) if note)
-        lines.append(
-            f"Service unit files: {enabled_display} enabled | {disabled_display} disabled"
-            + (f" ({note})" if note else "")
-        )
-
-        if restart_hints:
-            lines.append("Restart loops / flapping hints:")
-            for item in restart_hints[:4]:
-                lines.append(f"  {shorten(item, 140)}")
-        else:
-            lines.append("Restart loops / flapping hints: none in current boot journal.")
-        return lines
+        return self.systemd_health.collect()
 
     def collect_logs(self) -> list[str]:
-        privileged = self._privileged_section("logs")
-        if privileged:
-            lines: list[str] = []
-            snapshot_line = self._privileged_snapshot_line()
-            if snapshot_line:
-                lines.append(snapshot_line)
-            lines.append("Journal errors since boot:")
-            for item in privileged.get("journal_errors", [])[:5]:
-                lines.append(f"  {shorten(str(item), 150)}")
-            if not privileged.get("journal_errors"):
-                lines.append("  No matching entries.")
-            lines.append("Kernel warnings since boot:")
-            for item in privileged.get("kernel_warnings", [])[:5]:
-                lines.append(f"  {shorten(str(item), 150)}")
-            if not privileged.get("kernel_warnings"):
-                lines.append("  No matching entries.")
-            lines.append("Hardware / driver hints:")
-            for item in privileged.get("hardware_warnings", [])[:5]:
-                lines.append(f"  {shorten(str(item), 150)}")
-            if not privileged.get("hardware_warnings"):
-                lines.append("  No matching entries.")
-            return lines
-
-        lines: list[str] = []
-        journal_errors = run_command(
-            ["journalctl", "-b", "-p", "err", "-n", "10", "--no-pager", "-o", "short-iso"],
-            timeout=5.0,
-        )
-        kernel_warnings = run_command(
-            ["journalctl", "-k", "-b", "-p", "warning", "-n", "10", "--no-pager", "-o", "short-monotonic"],
-            timeout=5.0,
-        )
-        hardware_warnings = run_command(
-            [
-                "journalctl",
-                "-b",
-                f"--grep={HARDWARE_LOG_PATTERN}",
-                "-n",
-                "10",
-                "--no-pager",
-                "-o",
-                "short-iso",
-            ],
-            timeout=5.0,
-        )
-
-        lines.append("Journal errors since boot:")
-        for item in parse_journal_lines(journal_errors, limit=5):
-            lines.append(f"  {item}")
-
-        lines.append("Kernel warnings since boot:")
-        for item in parse_journal_lines(kernel_warnings, limit=5):
-            lines.append(f"  {item}")
-
-        lines.append("Hardware / driver hints:")
-        for item in parse_journal_lines(hardware_warnings, limit=5):
-            lines.append(f"  {item}")
-        return lines
+        return self.logs.collect()
 
     def _meminfo(self) -> dict[str, int]:
         info: dict[str, int] = {}
