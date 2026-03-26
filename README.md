@@ -82,6 +82,8 @@ State:
 
 - user-protected packages and removal preview cache are stored in `~/.local/state/monitor/package_cleanup_state.json` unless `XDG_STATE_HOME` is set
 - successful removals update the cached package inventory incrementally and only revalidate impacted/new roots instead of forcing a full catalog reload
+- monitor diff snapshots are stored in `~/.local/state/monitor/diff_snapshot.json` unless `XDG_STATE_HOME` or `MONITOR_DIFF_SNAPSHOT` is set
+- if an old repo-local `.monitor_state/diff_snapshot.json` exists in the current working directory, the monitor will migrate it forward automatically
 
 ## Colors
 

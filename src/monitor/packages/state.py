@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 from monitor.packages.common import CandidatePreview, STATE_VERSION
+from monitor.shared.paths import package_cleanup_state_path
 
 
 def state_path() -> Path:
-    root = os.environ.get("XDG_STATE_HOME")
-    if root:
-        return Path(root) / "monitor" / "package_cleanup_state.json"
-    return Path.home() / ".local" / "state" / "monitor" / "package_cleanup_state.json"
+    return package_cleanup_state_path()
 
 
 def load_state() -> dict[str, object]:
@@ -82,4 +79,3 @@ def save_state(protected_packages: set[str], fingerprint: str, cache: dict[str, 
     tmp_path = path.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp_path.replace(path)
-

@@ -26,6 +26,7 @@ from monitor.shared.constants import (
     PSEUDO_FILESYSTEMS,
     WIFI_LOG_PATTERN,
 )
+from monitor.shared.paths import diff_snapshot_state_path, legacy_repo_diff_snapshot_path
 from monitor.shared.text import line_list, parse_float, parse_int, read_lines, read_text
 
 
@@ -882,16 +883,25 @@ class MonitorBackend:
 
     @staticmethod
     def _diff_snapshot_path() -> Path:
-        override = os.environ.get("MONITOR_DIFF_SNAPSHOT")
-        if override:
-            return Path(override)
-        state_root = os.environ.get("XDG_STATE_HOME")
-        if state_root:
-            return Path(state_root) / "monitor" / "diff_snapshot.json"
-        return Path.cwd() / ".monitor_state" / "diff_snapshot.json"
+        return diff_snapshot_state_path()
+
+    @staticmethod
+    def _migrate_legacy_diff_snapshot(target: Path) -> None:
+        if os.environ.get("MONITOR_DIFF_SNAPSHOT"):
+            return
+        legacy = legacy_repo_diff_snapshot_path()
+        if legacy == target or target.exists() or not legacy.exists():
+            return
+        try:
+            payload = legacy.read_text(encoding="utf-8")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(payload, encoding="utf-8")
+        except OSError:
+            return
 
     def _load_diff_snapshot(self) -> dict[str, object] | None:
         path = self._diff_snapshot_path()
+        self._migrate_legacy_diff_snapshot(path)
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):

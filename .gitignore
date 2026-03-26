@@ -1,3 +1,4 @@
 __pycache__/
 *.py[cod]
+# Legacy local diff snapshot location, no longer written by the app.
 .monitor_state/
