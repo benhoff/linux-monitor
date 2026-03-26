@@ -1,8 +1,8 @@
 # monitor
 
-`monitor_tui.py` is a no-dependency Python TUI for Linux system health checks.
+`monitor-tui` is a no-dependency Python TUI for Linux system health checks.
 
-`package_cleanup_tui.py` is a separate no-dependency Python TUI for conservative package cleanup on Arch.
+`monitor-package-cleanup` is a separate no-dependency Python TUI for conservative package cleanup on Arch.
 It shows only installed official-repo packages that validate as removable candidates, hides built-in protected packages, and can mark additional packages as protected from inside the UI.
 
 On systems with a supported package manager (`pacman` or `apt`) it groups the dashboard into three core tabs plus package tabs:
@@ -20,9 +20,13 @@ Hardware-specific NVIDIA and AVMatrix sections are only shown when their monitor
 ## Run
 
 ```bash
-python3 monitor_tui.py
-python3 package_cleanup_tui.py
+monitor-tui
+monitor-package-cleanup
 ```
+
+If you are running directly from the repo without installing entrypoints, the repo-root
+`monitor_tui.py`, `package_cleanup_tui.py`, and `monitor_privileged_snapshot.py`
+files remain as compatibility wrappers.
 
 ## Keys
 
@@ -94,11 +98,11 @@ State:
 ## One-shot mode
 
 ```bash
-python3 monitor_tui.py --once --tab tier1
-python3 monitor_tui.py --once --tab tier2
-python3 monitor_tui.py --once --tab packages
-python3 monitor_tui.py --once --tab aur
-python3 monitor_tui.py --once --tab all
+monitor-tui --once --tab tier1
+monitor-tui --once --tab tier2
+monitor-tui --once --tab packages
+monitor-tui --once --tab aur
+monitor-tui --once --tab all
 ```
 
 ## Notes
@@ -120,13 +124,13 @@ python3 monitor_tui.py --once --tab all
 The safe privilege model is:
 
 - run the TUI as your normal user
-- run `monitor_privileged_snapshot.py` as root on a timer
+- run `monitor-privileged-snapshot` as root on a timer
 - let the TUI read `/run/monitor/privileged_snapshot.json`
 
 Write a snapshot manually:
 
 ```bash
-sudo python3 monitor_privileged_snapshot.py --output /run/monitor/privileged_snapshot.json
+sudo monitor-privileged-snapshot --output /run/monitor/privileged_snapshot.json
 ```
 
 Install the privileged snapshot service and timer:
@@ -150,7 +154,7 @@ monitor-privileged-refresh
 Use a different snapshot path:
 
 ```bash
-MONITOR_PRIVILEGED_SNAPSHOT=/path/to/privileged_snapshot.json python3 monitor_tui.py
+MONITOR_PRIVILEGED_SNAPSHOT=/path/to/privileged_snapshot.json monitor-tui
 ```
 
 Example systemd unit templates are in:
