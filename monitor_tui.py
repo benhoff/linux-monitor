@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import textwrap
 import threading
 import time
@@ -19,6 +20,21 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Sequence
+
+SRC_DIR = Path(__file__).resolve().parent / "src"
+if SRC_DIR.exists():
+    sys.path.insert(0, str(SRC_DIR))
+
+from monitor.shared.constants import (
+    DEFAULT_PRIVILEGED_SNAPSHOT_MAX_AGE,
+    DEFAULT_PRIVILEGED_SNAPSHOT_PATH,
+    FS_LOG_PATTERN,
+    HARDWARE_LOG_PATTERN,
+    PRIVILEGED_SNAPSHOT_VERSION,
+    PSEUDO_FILESYSTEMS,
+    WIFI_LOG_PATTERN,
+)
+from monitor.shared.text import line_list, parse_float, parse_int, read_lines, read_text
 
 
 BASE_TAB_ORDER = ("tier1", "tier2", "tier3", "packages", "aur")
@@ -32,37 +48,10 @@ BASE_TAB_TITLES = {
 PACKAGE_REFRESH_INTERVAL = 900
 PACKAGE_METADATA_INTERVAL = 600
 DIFF_SNAPSHOT_INTERVAL = 120
-DEFAULT_PRIVILEGED_SNAPSHOT = "/run/monitor/privileged_snapshot.json"
-PRIVILEGED_SNAPSHOT_VERSION = 3
-DEFAULT_PRIVILEGED_SNAPSHOT_MAX_AGE = 15 * 60
+DEFAULT_PRIVILEGED_SNAPSHOT = str(DEFAULT_PRIVILEGED_SNAPSHOT_PATH)
 PRIVILEGED_REFRESH_SCRIPT = "./refresh_monitor_privileged.sh"
 PACKAGE_EST_DOWNLOAD_BYTES_PER_SEC = 10 * 1024 * 1024
 PACKAGE_EST_AUR_SECONDS = 45
-PSEUDO_FILESYSTEMS = {
-    "autofs",
-    "binfmt_misc",
-    "bpf",
-    "cgroup",
-    "cgroup2",
-    "configfs",
-    "debugfs",
-    "devpts",
-    "devtmpfs",
-    "efivarfs",
-    "fusectl",
-    "hugetlbfs",
-    "mqueue",
-    "nsfs",
-    "overlay",
-    "proc",
-    "pstore",
-    "securityfs",
-    "selinuxfs",
-    "squashfs",
-    "sysfs",
-    "tmpfs",
-    "tracefs",
-}
 WATCHED_DIRS = (
     Path("/var/log"),
     Path("/var/cache"),
@@ -110,13 +99,7 @@ VM_IMAGE_SUFFIXES = (".qcow2", ".img", ".vdi", ".vmdk", ".vhd", ".vhdx")
 ENCODER_KEYWORDS = ("nvenc", "vaapi", "v4l2m2m", "qsv", "amf", "rkmpp")
 DEVICE_LOG_PATTERN = r"HDMI|EDID|drm|v4l2|CSI|camera|encoder|nvenc|mpp|video"
 CAPTURE_LOG_PATTERN = r"AVMatrix|HwsCapture|uvcvideo|videodev|v4l2|capture"
-FS_LOG_PATTERN = (
-    r"EXT4-fs error|BTRFS|XFS|Buffer I/O error|I/O error|"
-    r"read-only file system|Remounting filesystem read-only|mount failure|corrupt"
-)
 THROTTLE_LOG_PATTERN = r"throttl|thermal"
-HARDWARE_LOG_PATTERN = r"gpu|drm|hdmi|edid|nvme|ata|usb|pci|v4l2|camera|csi"
-WIFI_LOG_PATTERN = r"wlan|wifi|wireless|wpa_supplicant|NetworkManager|cfg80211|mac80211"
 BLUETOOTH_LOG_PATTERN = r"bluetooth|BlueZ|btusb|btintel|btmtk|hci\d+"
 KERNEL_PACKAGE_NAMES = (
     "linux",
@@ -229,22 +212,6 @@ def run_command(args: Sequence[str], timeout: float = 5.0) -> CommandResult:
         stderr=completed.stderr.strip(),
     )
 
-
-def read_text(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-
-
-def read_lines(path: Path, limit: int | None = None) -> list[str]:
-    text = read_text(path)
-    lines = text.splitlines()
-    if limit is not None:
-        return lines[-limit:]
-    return lines
-
-
 def format_bytes(value: float | int) -> str:
     units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
     size = float(value)
@@ -336,30 +303,6 @@ def first_nonempty_line(value: str) -> str:
         if line.strip():
             return line.strip()
     return ""
-
-
-def parse_int(value: str, default: int = 0) -> int:
-    match = re.search(r"-?\d+", value)
-    if not match:
-        return default
-    return int(match.group(0))
-
-
-def parse_float(value: str) -> float | None:
-    match = re.search(r"-?\d+(?:\.\d+)?", value)
-    if not match:
-        return None
-    try:
-        return float(match.group(0))
-    except ValueError:
-        return None
-
-
-def line_list(text: str, limit: int | None = None) -> list[str]:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if limit is not None:
-        return lines[:limit]
-    return lines
 
 
 def summarize_list(items: Sequence[str], limit: int = 3) -> str:

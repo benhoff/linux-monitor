@@ -13,7 +13,17 @@ REFRESH_INTERVAL="${MONITOR_SNAPSHOT_INTERVAL:-2min}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_SCRIPT="${SCRIPT_DIR}/monitor_privileged_snapshot.py"
 SOURCE_REFRESH="${SCRIPT_DIR}/refresh_monitor_privileged.sh"
+SOURCE_PACKAGE_ROOT="${SCRIPT_DIR}/src/monitor"
+SOURCE_SHARED_INIT="${SOURCE_PACKAGE_ROOT}/shared/__init__.py"
+SOURCE_SHARED_CONSTANTS="${SOURCE_PACKAGE_ROOT}/shared/constants.py"
+SOURCE_SHARED_TEXT="${SOURCE_PACKAGE_ROOT}/shared/text.py"
 INSTALLED_SCRIPT="${INSTALL_DIR}/monitor_privileged_snapshot.py"
+INSTALLED_PACKAGE_ROOT="${INSTALL_DIR}/src/monitor"
+INSTALLED_SHARED_DIR="${INSTALLED_PACKAGE_ROOT}/shared"
+INSTALLED_PACKAGE_INIT="${INSTALLED_PACKAGE_ROOT}/__init__.py"
+INSTALLED_SHARED_INIT="${INSTALLED_SHARED_DIR}/__init__.py"
+INSTALLED_SHARED_CONSTANTS="${INSTALLED_SHARED_DIR}/constants.py"
+INSTALLED_SHARED_TEXT="${INSTALLED_SHARED_DIR}/text.py"
 INSTALLED_REFRESH="${BIN_DIR}/monitor-privileged-refresh"
 SERVICE_PATH="${SYSTEMD_DIR}/${SERVICE_NAME}"
 TIMER_PATH="${SYSTEMD_DIR}/${TIMER_NAME}"
@@ -67,6 +77,10 @@ main() {
     printf 'Could not find %s\n' "${SOURCE_SCRIPT}" >&2
     exit 1
   fi
+  if [[ ! -f "${SOURCE_SHARED_INIT}" || ! -f "${SOURCE_SHARED_CONSTANTS}" || ! -f "${SOURCE_SHARED_TEXT}" ]]; then
+    printf 'Could not find required shared package files under %s\n' "${SOURCE_PACKAGE_ROOT}" >&2
+    exit 1
+  fi
 
   if [[ "${EUID}" -ne 0 ]]; then
     require_command sudo
@@ -78,7 +92,12 @@ main() {
   fi
 
   install -d -m 0755 "${INSTALL_DIR}"
+  install -d -m 0755 "${INSTALLED_SHARED_DIR}"
   install -m 0755 "${SOURCE_SCRIPT}" "${INSTALLED_SCRIPT}"
+  install -m 0644 "${SOURCE_PACKAGE_ROOT}/__init__.py" "${INSTALLED_PACKAGE_INIT}"
+  install -m 0644 "${SOURCE_SHARED_INIT}" "${INSTALLED_SHARED_INIT}"
+  install -m 0644 "${SOURCE_SHARED_CONSTANTS}" "${INSTALLED_SHARED_CONSTANTS}"
+  install -m 0644 "${SOURCE_SHARED_TEXT}" "${INSTALLED_SHARED_TEXT}"
   if [[ -f "${SOURCE_REFRESH}" ]]; then
     install -m 0755 "${SOURCE_REFRESH}" "${INSTALLED_REFRESH}"
   fi
@@ -91,6 +110,7 @@ main() {
   systemctl start "${SERVICE_NAME}"
 
   printf 'Installed %s\n' "${INSTALLED_SCRIPT}"
+  printf 'Installed shared package under %s\n' "${INSTALLED_PACKAGE_ROOT}"
   if [[ -f "${SOURCE_REFRESH}" ]]; then
     printf 'Installed %s\n' "${INSTALLED_REFRESH}"
   fi

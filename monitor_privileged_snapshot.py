@@ -8,45 +8,29 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Sequence
 
+SRC_DIR = Path(__file__).resolve().parent / "src"
+if SRC_DIR.exists():
+    sys.path.insert(0, str(SRC_DIR))
 
-DEFAULT_OUTPUT = Path("/run/monitor/privileged_snapshot.json")
-SNAPSHOT_VERSION = 3
-PSEUDO_FILESYSTEMS = {
-    "autofs",
-    "binfmt_misc",
-    "bpf",
-    "cgroup",
-    "cgroup2",
-    "configfs",
-    "debugfs",
-    "devpts",
-    "devtmpfs",
-    "efivarfs",
-    "fusectl",
-    "hugetlbfs",
-    "mqueue",
-    "nsfs",
-    "overlay",
-    "proc",
-    "pstore",
-    "securityfs",
-    "selinuxfs",
-    "squashfs",
-    "sysfs",
-    "tmpfs",
-    "tracefs",
-}
-HARDWARE_LOG_PATTERN = r"gpu|drm|hdmi|edid|nvme|ata|usb|pci|v4l2|camera|csi"
-FS_LOG_PATTERN = (
-    r"EXT4-fs error|BTRFS|XFS|Buffer I/O error|I/O error|"
-    r"read-only file system|Remounting filesystem read-only|mount failure|corrupt"
+from monitor.shared.constants import (
+    DEFAULT_PRIVILEGED_SNAPSHOT_PATH,
+    FS_LOG_PATTERN,
+    HARDWARE_LOG_PATTERN,
+    PRIVILEGED_SNAPSHOT_VERSION,
+    PSEUDO_FILESYSTEMS,
+    WIFI_LOG_PATTERN,
 )
-WIFI_LOG_PATTERN = r"wlan|wifi|wireless|wpa_supplicant|NetworkManager|cfg80211|mac80211"
+from monitor.shared.text import line_list as shared_line_list
+from monitor.shared.text import parse_float, parse_int, read_text
+
+DEFAULT_OUTPUT = DEFAULT_PRIVILEGED_SNAPSHOT_PATH
+SNAPSHOT_VERSION = PRIVILEGED_SNAPSHOT_VERSION
 
 
 def run_command(args: Sequence[str], timeout: float = 6.0) -> subprocess.CompletedProcess[str] | None:
@@ -63,34 +47,7 @@ def run_command(args: Sequence[str], timeout: float = 6.0) -> subprocess.Complet
 
 
 def line_list(text: str, limit: int | None = None) -> list[str]:
-    lines = [line.strip() for line in text.splitlines() if line.strip() and line.strip() != "-- No entries --"]
-    if limit is not None:
-        return lines[:limit]
-    return lines
-
-
-def read_text(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-
-
-def parse_int(value: str, default: int = 0) -> int:
-    match = re.search(r"-?\d+", value)
-    if not match:
-        return default
-    return int(match.group(0))
-
-
-def parse_float(value: str) -> float | None:
-    match = re.search(r"-?\d+(?:\.\d+)?", value)
-    if not match:
-        return None
-    try:
-        return float(match.group(0))
-    except ValueError:
-        return None
+    return shared_line_list(text, limit=limit, skip_no_entries=True)
 
 
 def command_lines(args: Sequence[str], timeout: float = 6.0, limit: int | None = None) -> list[str]:
