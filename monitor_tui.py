@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 
-TAB_ORDER = ("tier1", "tier2", "tier3", "packages", "aur")
-TAB_TITLES = {
+BASE_TAB_ORDER = ("tier1", "tier2", "tier3", "packages", "aur")
+BASE_TAB_TITLES = {
     "tier1": "Tier 1",
     "tier2": "Tier 2",
     "tier3": "Tier 3",
@@ -81,6 +81,7 @@ FS_LOG_PATTERN = (
 THROTTLE_LOG_PATTERN = r"throttl|thermal"
 HARDWARE_LOG_PATTERN = r"gpu|drm|hdmi|edid|nvme|ata|usb|pci|v4l2|camera|csi"
 WIFI_LOG_PATTERN = r"wlan|wifi|wireless|wpa_supplicant|NetworkManager|cfg80211|mac80211"
+BLUETOOTH_LOG_PATTERN = r"bluetooth|BlueZ|btusb|btintel|btmtk|hci\d+"
 KERNEL_PACKAGE_NAMES = (
     "linux",
     "linux-lts",
@@ -105,6 +106,20 @@ CAPTURE_STACK_MODULES = (
     "videobuf2_common",
     "videobuf2_dma_contig",
 )
+
+
+def read_os_release() -> dict[str, str]:
+    info: dict[str, str] = {}
+    for raw in read_lines(Path("/etc/os-release")):
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if value.startswith('"') and value.endswith('"'):
+            value = value[1:-1]
+        info[key] = value
+    return info
 
 
 @dataclass
@@ -491,14 +506,18 @@ def parse_iw_station_dump(text: str) -> dict[str, object]:
     return state
 
 
-def parse_rfkill_output(text: str) -> list[dict[str, object]]:
+def parse_rfkill_output(text: str, allowed_types: Sequence[str] | None = None) -> list[dict[str, object]]:
+    type_filters = {
+        entry.strip().lower()
+        for entry in (allowed_types or ("wireless lan", "wlan", "wifi"))
+    }
     radios: list[dict[str, object]] = []
     current: dict[str, object] | None = None
     for raw in text.splitlines():
         line = raw.rstrip()
         header = re.match(r"^\d+:\s+([^:]+):\s+(.+)$", line.strip())
         if header:
-            if current and str(current.get("type", "")).lower() in {"wireless lan", "wlan", "wifi"}:
+            if current and str(current.get("type", "")).lower() in type_filters:
                 radios.append(current)
             current = {
                 "name": header.group(1).strip(),
@@ -513,9 +532,79 @@ def parse_rfkill_output(text: str) -> list[dict[str, object]]:
             current["soft_blocked"] = value.lower() == "yes"
         elif lower == "hard blocked":
             current["hard_blocked"] = value.lower() == "yes"
-    if current and str(current.get("type", "")).lower() in {"wireless lan", "wlan", "wifi"}:
+    if current and str(current.get("type", "")).lower() in type_filters:
         radios.append(current)
     return radios
+
+
+def parse_bluetoothctl_devices(text: str) -> list[dict[str, object]]:
+    devices: list[dict[str, object]] = []
+    for raw in text.splitlines():
+        match = re.match(r"^Device\s+([0-9A-F:]{17})\s+(.+)$", raw.strip(), re.IGNORECASE)
+        if not match:
+            continue
+        devices.append(
+            {
+                "address": match.group(1).upper(),
+                "name": match.group(2).strip(),
+            }
+        )
+    return devices
+
+
+def parse_bluetoothctl_show(text: str) -> dict[str, object]:
+    state: dict[str, object] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        header = re.match(r"^Controller\s+([0-9A-F:]{17})\s+(.+?)(?:\s+\[default\])?$", line, re.IGNORECASE)
+        if header:
+            state["address"] = header.group(1).upper()
+            state["name"] = header.group(2).strip()
+            continue
+        if ":" not in line:
+            continue
+        key, value = [part.strip() for part in line.split(":", 1)]
+        lower = key.lower()
+        if lower in {"powered", "discoverable", "discovering", "pairable"}:
+            state[lower] = value.lower() == "yes"
+        elif lower in {"name", "alias", "class", "modalias"}:
+            state[lower] = value
+    return state
+
+
+def parse_bluetoothctl_info(text: str) -> dict[str, object]:
+    state: dict[str, object] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        header = re.match(r"^Device\s+([0-9A-F:]{17})\s+(.+)$", line, re.IGNORECASE)
+        if header:
+            state["address"] = header.group(1).upper()
+            state["name"] = header.group(2).strip()
+            continue
+        if ":" not in line:
+            continue
+        key, value = [part.strip() for part in line.split(":", 1)]
+        lower = key.lower()
+        if lower in {"name", "alias", "icon"}:
+            state[lower] = value
+        elif lower in {"paired", "trusted", "blocked", "connected", "legacypairing", "wakeallowed"}:
+            state[lower] = value.lower() == "yes"
+        elif lower == "battery percentage":
+            match = re.search(r"\((\d+)\)", value)
+            state["battery_pct"] = int(match.group(1)) if match else parse_int(value, default=-1)
+        elif lower == "rssi":
+            number = parse_float(value)
+            if number is not None:
+                state["rssi_dbm"] = number
+        elif lower == "txpower":
+            number = parse_float(value)
+            if number is not None:
+                state["tx_power_dbm"] = number
+    return state
 
 
 def detect_ro_mounts() -> list[str]:
@@ -554,6 +643,17 @@ class MonitorBackend:
         self.cache: dict[str, tuple[float, object]] = {}
         self.cpu_prev: tuple[float, dict[str, int]] | None = None
         self.disk_prev: tuple[float, dict[str, tuple[int, int]]] | None = None
+        self.os_release = read_os_release()
+        self.distro_id = self.os_release.get("ID", "").strip().lower()
+        self.distro_like = {
+            item.strip().lower()
+            for item in self.os_release.get("ID_LIKE", "").split()
+            if item.strip()
+        }
+        self.package_backend = self._detect_package_backend()
+        self.supports_aur = self.package_backend == "pacman" and shutil.which("yay") is not None
+        self.dns_probe_host = self._dns_probe_target()
+        self.package_cache_label, self.package_cache_path = self._package_cache_config()
         self.package_state = PackageRefreshState()
         self.package_lock = threading.Lock()
         self.package_force_event = threading.Event()
@@ -562,6 +662,47 @@ class MonitorBackend:
         self.package_worker_started = False
         sort_mode = os.environ.get("MONITOR_PACKAGE_SORT", "size").strip().lower()
         self.package_sort_mode = sort_mode if sort_mode in {"size", "name"} else "size"
+
+    def _detect_package_backend(self) -> str:
+        if shutil.which("pacman") is not None:
+            return "pacman"
+        if shutil.which("apt-get") is not None and shutil.which("dpkg-query") is not None:
+            return "apt"
+        return "none"
+
+    def _dns_probe_target(self) -> str:
+        if self.distro_id == "debian" or "debian" in self.distro_like:
+            return "deb.debian.org"
+        if self.distro_id in {"ubuntu", "linuxmint", "pop"} or {"ubuntu"} & self.distro_like:
+            return "archive.ubuntu.com"
+        return "archlinux.org"
+
+    def _package_cache_config(self) -> tuple[str, Path | None]:
+        if self.package_backend == "pacman":
+            return "Pacman cache", Path("/var/cache/pacman/pkg")
+        if self.package_backend == "apt":
+            return "APT cache", Path("/var/cache/apt/archives")
+        return "Package cache", None
+
+    def package_monitoring_enabled(self) -> bool:
+        return self.package_backend == "pacman"
+
+    def nvidia_monitoring_enabled(self) -> bool:
+        return bool(self.cached("nvidia_monitoring_enabled", 60.0, self._detect_nvidia_monitoring))
+
+    def _detect_nvidia_monitoring(self) -> bool:
+        if Path("/proc/driver/nvidia/version").exists():
+            return True
+        if shutil.which("nvidia-smi") is not None:
+            return True
+        return False
+
+    def capture_monitoring_enabled(self) -> bool:
+        return bool(self.cached("capture_monitoring_enabled", 60.0, self._detect_capture_monitoring))
+
+    def _detect_capture_monitoring(self) -> bool:
+        cards = self.cached("capture_cards", 30.0, self._capture_cards)
+        return any("avmatrix" in card.lower() for card in cards)
 
     def cached(self, key: str, ttl: float, producer: Callable[[], object]) -> object:
         now = time.time()
@@ -857,6 +998,7 @@ class MonitorBackend:
 
         snapshot_health = self._privileged_snapshot_health()
         wifi_digest = self._wifi_digest()
+        bluetooth_digest = self._bluetooth_digest()
 
         capture_cards = self.cached("capture_cards", 30.0, self._capture_cards)
         avmatrix_cards = [card for card in capture_cards if "avmatrix" in card.lower()]
@@ -915,6 +1057,7 @@ class MonitorBackend:
                 "age": snapshot_health.get("age"),
             },
             "wifi": wifi_digest,
+            "bluetooth": bluetooth_digest,
             "capture": {
                 "avmatrix_cards": len(avmatrix_cards),
                 "kernel_channels": len(avmatrix_sysfs_nodes),
@@ -1042,6 +1185,22 @@ class MonitorBackend:
             previous_blocked = bool(previous_wifi.get("blocked"))
             if current_blocked != previous_blocked:
                 changes.append("Wi-Fi radio: blocked" if current_blocked else "Wi-Fi radio: unblocked")
+
+        current_bluetooth = current.get("bluetooth", {})
+        previous_bluetooth = previous.get("bluetooth", {})
+        if isinstance(current_bluetooth, dict) and isinstance(previous_bluetooth, dict):
+            current_connected = current_bluetooth.get("connected_count")
+            previous_connected = previous_bluetooth.get("connected_count")
+            if isinstance(current_connected, int) and isinstance(previous_connected, int) and current_connected != previous_connected:
+                changes.append(f"Bluetooth: {current_connected - previous_connected:+d} connected devices ({current_connected} now)")
+            current_blocked = bool(current_bluetooth.get("blocked"))
+            previous_blocked = bool(previous_bluetooth.get("blocked"))
+            if current_blocked != previous_blocked:
+                changes.append("Bluetooth radio: blocked" if current_blocked else "Bluetooth radio: unblocked")
+            current_powered = current_bluetooth.get("powered")
+            previous_powered = previous_bluetooth.get("powered")
+            if isinstance(current_powered, bool) and isinstance(previous_powered, bool) and current_powered != previous_powered:
+                changes.append("Bluetooth controller: powered on" if current_powered else "Bluetooth controller: powered off")
 
         current_capture = current.get("capture", {})
         previous_capture = previous.get("capture", {})
@@ -1180,6 +1339,27 @@ class MonitorBackend:
             if connected and isinstance(beacon_loss, int) and beacon_loss > 0:
                 problems.append((70, f"? Wi-Fi reports beacon loss ({beacon_loss})"))
 
+        bluetooth = current.get("bluetooth", {})
+        if isinstance(bluetooth, dict):
+            adapter_count = bluetooth.get("adapter_count")
+            blocked = bool(bluetooth.get("blocked"))
+            powered = bluetooth.get("powered")
+            service_active = str(bluetooth.get("service_active", "unknown"))
+            connected_count = bluetooth.get("connected_count")
+            issue_count = bluetooth.get("issue_count")
+            if isinstance(adapter_count, int) and adapter_count > 0:
+                if blocked:
+                    problems.append((70, "? Bluetooth radio is rfkill-blocked"))
+                elif service_active == "active" and powered is False:
+                    problems.append((50, "? Bluetooth controller is present but powered off"))
+                if (
+                    isinstance(issue_count, int)
+                    and issue_count > 0
+                    and isinstance(connected_count, int)
+                    and connected_count > 0
+                ):
+                    problems.append((45, f"? Bluetooth journal shows {issue_count} recent issue hints"))
+
         capture = current.get("capture", {})
         if isinstance(capture, dict):
             avmatrix_cards = capture.get("avmatrix_cards")
@@ -1215,6 +1395,8 @@ class MonitorBackend:
         return deduped[:5]
 
     def start_package_worker(self) -> None:
+        if not self.package_monitoring_enabled():
+            return
         if self.package_worker_started:
             return
         self.package_worker_started = True
@@ -1261,7 +1443,30 @@ class MonitorBackend:
             updates[name] = (current, latest)
         return updates
 
+    @staticmethod
+    def _filter_installed_updates(
+        updates: dict[str, tuple[str, str]],
+        installed: Sequence[str],
+    ) -> dict[str, tuple[str, str]]:
+        installed_names = set(installed)
+        return {
+            name: versions
+            for name, versions in updates.items()
+            if name in installed_names
+        }
+
     def refresh_package_state_sync(self) -> None:
+        if not self.package_monitoring_enabled():
+            with self.package_lock:
+                self.package_state = PackageRefreshState(
+                    loading=False,
+                    last_updated=time.time(),
+                    official_updates={},
+                    aur_updates={},
+                    official_error="package monitoring is only implemented for pacman systems",
+                    aur_error=None,
+                )
+            return
         with self.package_lock:
             previous = self.package_state
             self.package_state = PackageRefreshState(
@@ -1273,18 +1478,39 @@ class MonitorBackend:
                 aur_error=previous.aur_error,
             )
         official_lines, official_error = self._official_updates()
-        aur_lines, aur_error = self._aur_updates()
+        aur_lines: list[str] = []
+        aur_error: str | None = None
+        if self.supports_aur:
+            aur_lines, aur_error = self._aur_updates()
+        installed_packages = self._installed_packages()
+        official_updates = self._filter_installed_updates(
+            self._parse_update_map(official_lines),
+            installed_packages,
+        )
+        aur_updates = self._filter_installed_updates(
+            self._parse_update_map(aur_lines),
+            installed_packages,
+        )
         with self.package_lock:
             self.package_state = PackageRefreshState(
                 loading=False,
                 last_updated=time.time(),
-                official_updates=self._parse_update_map(official_lines),
-                aur_updates=self._parse_update_map(aur_lines),
+                official_updates=official_updates,
+                aur_updates=aur_updates,
                 official_error=official_error,
                 aur_error=aur_error,
             )
 
     def _package_state_snapshot(self) -> PackageRefreshState:
+        if not self.package_monitoring_enabled():
+            return PackageRefreshState(
+                loading=False,
+                last_updated=time.time(),
+                official_updates={},
+                aur_updates={},
+                official_error="package monitoring is only implemented for pacman systems",
+                aur_error=None,
+            )
         if not self.package_worker_started and self.package_state.last_updated == 0.0:
             self.refresh_package_state_sync()
         with self.package_lock:
@@ -1474,13 +1700,25 @@ class MonitorBackend:
         )
 
     def _installed_packages(self) -> dict[str, str]:
-        result = run_command(["pacman", "-Q"], timeout=6.0)
         packages: dict[str, str] = {}
-        for raw in line_list(result.stdout):
-            parts = raw.split(None, 1)
-            if len(parts) != 2:
-                continue
-            packages[parts[0]] = parts[1]
+        if self.package_backend == "pacman":
+            result = run_command(["pacman", "-Q"], timeout=6.0)
+            for raw in line_list(result.stdout):
+                parts = raw.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                packages[parts[0]] = parts[1]
+            return packages
+        if self.package_backend == "apt":
+            result = run_command(
+                ["dpkg-query", "-W", "-f=${Package} ${Version}\n"],
+                timeout=10.0,
+            )
+            for raw in line_list(result.stdout):
+                parts = raw.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                packages[parts[0]] = parts[1]
         return packages
 
     def _running_kernel_version(self) -> str:
@@ -1575,6 +1813,8 @@ class MonitorBackend:
         return 0, None
 
     def _official_updates(self) -> tuple[list[str], str | None]:
+        if self.package_backend != "pacman":
+            return [], "repo update monitoring is only implemented for pacman systems"
         return self.command_lines(
             ["checkupdates"],
             fallback=["pacman", "-Qu"],
@@ -1582,21 +1822,54 @@ class MonitorBackend:
         )
 
     def _aur_updates(self) -> tuple[list[str], str | None]:
+        if not self.supports_aur:
+            return [], None
         return self.command_lines(["yay", "-Qua"], timeout=12.0)
 
     def _count_explicit(self) -> tuple[int | None, str | None]:
+        if self.package_backend != "pacman":
+            return None, "explicit package count is only implemented for pacman systems"
         return self.count_command_lines(["pacman", "-Qe"])
 
     def _count_dependencies(self) -> tuple[int | None, str | None]:
+        if self.package_backend != "pacman":
+            return None, "dependency package count is only implemented for pacman systems"
         return self.count_command_lines(["pacman", "-Qd"])
 
     def _orphan_packages(self) -> tuple[list[str], str | None]:
+        if self.package_backend == "apt":
+            result = run_command(["apt-get", "-s", "autoremove"], timeout=8.0)
+            if result.stdout or result.ok:
+                packages = []
+                for raw in result.stdout.splitlines():
+                    if not raw.startswith("Remv "):
+                        continue
+                    parts = raw.split()
+                    if len(parts) >= 2:
+                        packages.append(parts[1])
+                return packages, None
+            if result.missing:
+                return [], "apt-get not found"
+            if result.timed_out:
+                return [], "apt-get timed out"
+            if result.stderr:
+                return [], shorten(single_line(result.stderr), 120)
+            return [], None
+        if self.package_backend != "pacman":
+            return [], "orphan detection is unavailable for this package backend"
         return self.command_lines(["pacman", "-Qtdq"])
 
     def _foreign_packages(self) -> tuple[list[str], str | None]:
+        if self.package_backend != "pacman":
+            return [], "foreign package detection is only implemented for pacman systems"
         return self.command_lines(["pacman", "-Qm"])
 
     def _ignored_packages(self) -> list[str]:
+        if self.package_backend == "apt":
+            result = run_command(["apt-mark", "showhold"], timeout=4.0)
+            return line_list(result.stdout)
+        if self.package_backend != "pacman":
+            return []
         ignored: list[str] = []
         for raw in read_lines(Path("/etc/pacman.conf")):
             line = raw.split("#", 1)[0].strip()
@@ -1608,6 +1881,8 @@ class MonitorBackend:
         return ignored
 
     def _recent_upgrades(self) -> list[str]:
+        if self.package_backend != "pacman":
+            return []
         pacman_log = Path("/var/log/pacman.log")
         if not pacman_log.exists():
             return []
@@ -1683,14 +1958,15 @@ class MonitorBackend:
         else:
             lines.append("  no tracked firmware package installed")
 
-        lines.append("NVIDIA:")
-        lines.append(f"  loaded module: {nvidia_module}")
-        if nvidia_packages:
-            for name, version in nvidia_packages:
-                latest = self._latest_version_for(name, kernel_updates)
-                lines.append(f"  {self._package_line(name, version, latest)}")
-        else:
-            lines.append("  no tracked NVIDIA package installed")
+        if self.nvidia_monitoring_enabled() or nvidia_packages:
+            lines.append("NVIDIA:")
+            lines.append(f"  loaded module: {nvidia_module}")
+            if nvidia_packages:
+                for name, version in nvidia_packages:
+                    latest = self._latest_version_for(name, kernel_updates)
+                    lines.append(f"  {self._package_line(name, version, latest)}")
+            else:
+                lines.append("  no tracked NVIDIA package installed")
         return lines
 
     def _collect_update_backlog(self, source: str) -> list[str]:
@@ -2457,9 +2733,10 @@ class MonitorBackend:
         else:
             lines.append("  No battery or AC state exposed.")
 
-        lines.append("GPU thermal / power:")
-        for item in self._gpu_telemetry()[:4]:
-            lines.append(f"  {item}")
+        if self.nvidia_monitoring_enabled():
+            lines.append("GPU thermal / power:")
+            for item in self._gpu_telemetry()[:4]:
+                lines.append(f"  {item}")
         return lines
 
     def _smart_devices(self) -> list[str]:
@@ -3131,7 +3408,7 @@ class MonitorBackend:
         return "no nameservers found"
 
     def _dns_check(self) -> str:
-        result = run_command(["getent", "ahosts", "archlinux.org"], timeout=3.0)
+        result = run_command(["getent", "ahosts", self.dns_probe_host], timeout=3.0)
         if result.stdout:
             return result.stdout.splitlines()[0].split()[0]
         if result.stderr:
@@ -3173,6 +3450,169 @@ class MonitorBackend:
             timeout=5.0,
         )
         return parse_journal_lines(result, limit=6)
+
+    def _unit_status(self, action: str, unit: str) -> str:
+        result = run_command(["systemctl", action, unit], timeout=3.0)
+        if result.stdout:
+            return first_nonempty_line(result.stdout)
+        if result.missing:
+            return "systemctl not found"
+        if result.timed_out:
+            return "systemctl timed out"
+        if result.stderr:
+            lowered = result.stderr.lower()
+            if "failed to connect to system scope bus" in lowered or "operation not permitted" in lowered:
+                return "system bus unavailable"
+            return shorten(single_line(first_nonempty_line(result.stderr)), 120)
+        return "unknown"
+
+    def _rfkill_radios_from_sysfs(self, allowed_types: Sequence[str]) -> list[dict[str, object]]:
+        type_filters = {entry.strip().lower() for entry in allowed_types}
+        root = Path("/sys/class/rfkill")
+        if not root.exists():
+            return []
+        radios: list[dict[str, object]] = []
+        for path in sorted(root.iterdir()):
+            radio_type = read_text(path / "type").strip().lower()
+            if radio_type not in type_filters:
+                continue
+            radios.append(
+                {
+                    "name": read_text(path / "name").strip() or path.name,
+                    "type": radio_type,
+                    "soft_blocked": read_text(path / "soft").strip() == "1",
+                    "hard_blocked": read_text(path / "hard").strip() == "1",
+                }
+            )
+        return radios
+
+    def _bluetooth_adapters(self) -> list[str]:
+        root = Path("/sys/class/bluetooth")
+        if not root.exists():
+            return []
+        return sorted(path.name for path in root.iterdir())
+
+    def _bluetooth_logs(self) -> list[str]:
+        result = run_command(
+            [
+                "journalctl",
+                "-b",
+                f"--grep={BLUETOOTH_LOG_PATTERN}",
+                "-n",
+                "12",
+                "--no-pager",
+                "-o",
+                "short-iso",
+            ],
+            timeout=5.0,
+        )
+        return parse_journal_lines(result, limit=8)
+
+    def _bluetoothctl_text(self, args: Sequence[str], timeout: float = 4.0) -> tuple[str, str | None]:
+        result = run_command(["bluetoothctl", *args], timeout=timeout)
+        if result.stdout:
+            return result.stdout, None
+        if result.missing:
+            return "", "bluetoothctl not found"
+        if result.timed_out:
+            return "", "bluetoothctl timed out"
+        if result.stderr:
+            lowered = result.stderr.lower()
+            if "dbus_connection_get_object_path_data" in lowered or "connection != null" in lowered:
+                return "", "bluetoothctl failed to connect to D-Bus"
+            return "", shorten(single_line(first_nonempty_line(result.stderr)), 120)
+        return "", f"bluetoothctl exited {result.returncode}"
+
+    @staticmethod
+    def _bluetooth_device_sort_key(entry: dict[str, object]) -> tuple[int, int, int, str]:
+        connected = 0 if entry.get("connected") else 1
+        trusted = 0 if entry.get("trusted") else 1
+        paired = 0 if entry.get("paired") else 1
+        name = str(entry.get("alias") or entry.get("name") or entry.get("address") or "")
+        return (connected, trusted, paired, name.lower())
+
+    @staticmethod
+    def _bluetooth_issue_logs(entries: Sequence[str]) -> list[str]:
+        issue_keywords = (
+            "error",
+            "fail",
+            "failed",
+            "timeout",
+            "disconnect",
+            "denied",
+            "blocked",
+            "abort",
+            "missing",
+        )
+        return [entry for entry in entries if any(token in entry.lower() for token in issue_keywords)][:4]
+
+    def _live_bluetooth_state(self) -> dict[str, object]:
+        service_active = self._unit_status("is-active", "bluetooth.service")
+        service_enabled = self._unit_status("is-enabled", "bluetooth.service")
+        adapters = self._bluetooth_adapters()
+        rfkill = self._rfkill_radios_from_sysfs(("bluetooth",))
+        if not rfkill:
+            rfkill_result = run_command(["rfkill", "list"], timeout=3.0)
+            rfkill = parse_rfkill_output(rfkill_result.stdout, allowed_types=("bluetooth",)) if rfkill_result.stdout else []
+
+        controller: dict[str, object] = {}
+        devices: list[dict[str, object]] = []
+        notes: list[str] = []
+        should_query_bluetoothctl = bool(adapters) or service_active in {"active", "activating"}
+        if should_query_bluetoothctl:
+            show_text, show_error = self._bluetoothctl_text(["show"], timeout=4.0)
+            if show_text and "No default controller available" not in show_text:
+                controller = parse_bluetoothctl_show(show_text)
+            elif show_error:
+                notes.append(show_error)
+
+            paired_text, paired_error = self._bluetoothctl_text(["paired-devices"], timeout=4.0)
+            connected_text, connected_error = self._bluetoothctl_text(["devices", "Connected"], timeout=4.0)
+
+            known_devices: dict[str, dict[str, object]] = {}
+            if paired_text:
+                for entry in parse_bluetoothctl_devices(paired_text):
+                    address = str(entry.get("address", "")).upper()
+                    if not address:
+                        continue
+                    known_devices[address] = {**entry, "paired": True}
+            if connected_text:
+                for entry in parse_bluetoothctl_devices(connected_text):
+                    address = str(entry.get("address", "")).upper()
+                    if not address:
+                        continue
+                    known = known_devices.setdefault(address, dict(entry))
+                    known.update(entry)
+                    known["connected"] = True
+            for error in (paired_error, connected_error):
+                if error and error not in notes:
+                    notes.append(error)
+
+            for address in list(known_devices)[:10]:
+                info_text, info_error = self._bluetoothctl_text(["info", address], timeout=4.0)
+                if info_text:
+                    known_devices[address].update(parse_bluetoothctl_info(info_text))
+                elif info_error and info_error not in notes:
+                    notes.append(info_error)
+            devices = sorted(known_devices.values(), key=self._bluetooth_device_sort_key)
+
+        logs = self.cached("bluetooth_logs", 60.0, self._bluetooth_logs)
+        return {
+            "service_active": service_active,
+            "service_enabled": service_enabled,
+            "adapters": adapters,
+            "rfkill": rfkill,
+            "controller": controller,
+            "devices": devices,
+            "logs": logs,
+            "notes": notes,
+        }
+
+    def _bluetooth_state(self) -> dict[str, object]:
+        live = self.cached("bluetooth_live_state", 15.0, self._live_bluetooth_state)
+        if isinstance(live, dict):
+            return live
+        return {}
 
     def _live_wifi_state(self) -> dict[str, object]:
         quality = self.cached("proc_net_wireless", 5.0, self._proc_net_wireless)
@@ -3479,6 +3919,162 @@ class MonitorBackend:
             digest["beacon_loss"] = beacon_loss
         return digest
 
+    @staticmethod
+    def _bluetooth_device_line(entry: dict[str, object]) -> str:
+        name = str(entry.get("alias") or entry.get("name") or entry.get("address") or "device").strip()
+        address = str(entry.get("address", "")).strip()
+        icon = str(entry.get("icon", "")).strip()
+        parts = [name]
+        if address and address != name:
+            parts.append(address)
+        if icon:
+            parts.append(icon)
+        flags = []
+        if entry.get("connected"):
+            flags.append("connected")
+        if entry.get("trusted"):
+            flags.append("trusted")
+        if entry.get("paired"):
+            flags.append("paired")
+        if entry.get("blocked"):
+            flags.append("blocked")
+        battery = entry.get("battery_pct")
+        rssi = entry.get("rssi_dbm")
+        tx_power = entry.get("tx_power_dbm")
+        if isinstance(battery, int) and battery >= 0:
+            parts.append(f"battery {battery}%")
+        if isinstance(rssi, (int, float)):
+            parts.append(f"RSSI {rssi:.0f} dBm")
+        if isinstance(tx_power, (int, float)):
+            parts.append(f"tx {tx_power:.0f} dBm")
+        if flags:
+            parts.append("/".join(flags))
+        return " | ".join(parts)
+
+    def _bluetooth_digest(self) -> dict[str, object]:
+        state = self._bluetooth_state()
+        adapters = state.get("adapters", [])
+        rfkill = state.get("rfkill", [])
+        controller = state.get("controller", {})
+        devices = state.get("devices", [])
+        logs = state.get("logs", [])
+        digest: dict[str, object] = {
+            "adapter_count": len(adapters) if isinstance(adapters, list) else 0,
+            "blocked": False,
+            "connected_count": 0,
+            "paired_count": 0,
+            "trusted_count": 0,
+            "service_active": str(state.get("service_active", "unknown")),
+        }
+        if isinstance(rfkill, list):
+            for radio in rfkill:
+                if not isinstance(radio, dict):
+                    continue
+                if radio.get("soft_blocked") or radio.get("hard_blocked"):
+                    digest["blocked"] = True
+                    break
+        if isinstance(controller, dict) and controller:
+            powered = controller.get("powered")
+            if isinstance(powered, bool):
+                digest["powered"] = powered
+            discovering = controller.get("discovering")
+            if isinstance(discovering, bool):
+                digest["discovering"] = discovering
+        if isinstance(devices, list):
+            parsed_devices = [entry for entry in devices if isinstance(entry, dict)]
+            digest["connected_count"] = sum(1 for entry in parsed_devices if entry.get("connected"))
+            digest["paired_count"] = sum(1 for entry in parsed_devices if entry.get("paired"))
+            digest["trusted_count"] = sum(1 for entry in parsed_devices if entry.get("trusted"))
+        if isinstance(logs, list):
+            digest["issue_count"] = len(self._bluetooth_issue_logs(logs))
+        return digest
+
+    def collect_bluetooth(self) -> list[str]:
+        state = self._bluetooth_state()
+        adapters = state.get("adapters", [])
+        rfkill = state.get("rfkill", [])
+        controller = state.get("controller", {})
+        devices = state.get("devices", [])
+        logs = state.get("logs", [])
+        notes = state.get("notes", [])
+        service_active = str(state.get("service_active", "unknown"))
+        service_enabled = str(state.get("service_enabled", "unknown"))
+
+        lines: list[str] = [f"Service: {service_active} | {service_enabled}"]
+
+        if isinstance(adapters, list) and adapters:
+            lines.append(f"Adapters: {len(adapters)} detected ({', '.join(adapters[:4])})")
+        else:
+            lines.append("Adapters: none detected")
+
+        if isinstance(rfkill, list) and rfkill:
+            radio_parts = []
+            for radio in rfkill[:4]:
+                if not isinstance(radio, dict):
+                    continue
+                name = str(radio.get("name", "bluetooth"))
+                status = "hard-blocked" if radio.get("hard_blocked") else "soft-blocked" if radio.get("soft_blocked") else "unblocked"
+                radio_parts.append(f"{name} {status}")
+            if radio_parts:
+                lines.append("RFKill: " + " | ".join(radio_parts))
+
+        if isinstance(controller, dict) and controller:
+            parts = []
+            name = str(controller.get("alias") or controller.get("name") or controller.get("address") or "controller").strip()
+            address = str(controller.get("address", "")).strip()
+            parts.append(name)
+            if address and address != name:
+                parts.append(address)
+            powered = controller.get("powered")
+            discoverable = controller.get("discoverable")
+            pairable = controller.get("pairable")
+            discovering = controller.get("discovering")
+            if isinstance(powered, bool):
+                parts.append("powered" if powered else "powered off")
+            if isinstance(discoverable, bool):
+                parts.append("discoverable" if discoverable else "non-discoverable")
+            if isinstance(pairable, bool):
+                parts.append("pairable" if pairable else "non-pairable")
+            if isinstance(discovering, bool):
+                parts.append("scanning" if discovering else "idle")
+            lines.append("Controller: " + " | ".join(parts))
+
+        parsed_devices = [entry for entry in devices if isinstance(entry, dict)] if isinstance(devices, list) else []
+        connected_devices = [entry for entry in parsed_devices if entry.get("connected")]
+        trusted_count = sum(1 for entry in parsed_devices if entry.get("trusted"))
+        paired_count = sum(1 for entry in parsed_devices if entry.get("paired"))
+        lines.append(
+            "Devices: "
+            + f"{paired_count} paired | {trusted_count} trusted | {len(connected_devices)} connected"
+        )
+
+        if connected_devices:
+            lines.append("Connected devices:")
+            for entry in connected_devices[:4]:
+                lines.append(f"  {self._bluetooth_device_line(entry)}")
+        elif parsed_devices:
+            lines.append("Known devices:")
+            for entry in parsed_devices[:4]:
+                lines.append(f"  {self._bluetooth_device_line(entry)}")
+        else:
+            lines.append("Devices: no paired or connected devices reported.")
+
+        if isinstance(notes, list) and notes:
+            lines.append("Collector notes:")
+            for note in notes[:3]:
+                lines.append(f"  {note}")
+
+        lines.append("Recent Bluetooth logs:")
+        issues = self._bluetooth_issue_logs(logs) if isinstance(logs, list) else []
+        if issues:
+            for item in issues[:4]:
+                lines.append(f"  {item}")
+        elif isinstance(logs, list) and logs:
+            lines.append("  No obvious Bluetooth warnings in current boot journal.")
+        else:
+            lines.append("  No Bluetooth journal entries found this boot.")
+        return lines
+
     def collect_wifi(self) -> list[str]:
         state = self._wifi_state()
         snapshot_line = self._privileged_snapshot_line() if self._privileged_section("wifi") else None
@@ -3552,7 +4148,7 @@ class MonitorBackend:
                 lines.append("  No interfaces available.")
             lines.append(f"Default route: {default_route}")
             lines.append(f"DNS servers: {dns_servers}")
-            lines.append(f"DNS lookup: archlinux.org -> {dns_check}")
+            lines.append(f"DNS lookup: {self.dns_probe_host} -> {dns_check}")
             if established is None or listening is None:
                 lines.append("Connections: unavailable (socket inspection failed)")
             else:
@@ -3570,7 +4166,7 @@ class MonitorBackend:
             lines.append(f"  {item}")
         lines.append(f"Default route: {default_route}")
         lines.append(f"DNS servers: {dns_servers}")
-        lines.append(f"DNS lookup: archlinux.org -> {dns_check}")
+        lines.append(f"DNS lookup: {self.dns_probe_host} -> {dns_check}")
         if established is None or listening is None:
             lines.append("Connections: unavailable (socket inspection failed)")
         else:
@@ -3687,7 +4283,15 @@ class MonitorBackend:
 
     def collect_hygiene(self) -> list[str]:
         orphaned, orphan_error = self.cached("orphans_hygiene", 900.0, self._orphan_packages)
-        pacman_cache = self.cached("pacman_cache_size", 300.0, lambda: self._path_size(Path("/var/cache/pacman/pkg")))
+        package_cache = (
+            self.cached(
+                "package_cache_size",
+                300.0,
+                lambda: self._path_size(self.package_cache_path) if self.package_cache_path is not None else None,
+            )
+            if self.package_cache_path is not None
+            else None
+        )
         log_dir = self.cached("log_dir_size", 300.0, lambda: self._path_size(Path("/var/log")))
         tmp_dir = self.cached("tmp_dir_size", 300.0, lambda: self._path_size(Path("/tmp")))
         var_tmp_dir = self.cached("var_tmp_dir_size", 300.0, lambda: self._path_size(Path("/var/tmp")))
@@ -3699,7 +4303,8 @@ class MonitorBackend:
         if orphaned:
             lines.append(f"  {', '.join(orphaned[:10])}")
         lines.append(
-            "Pacman cache: " + (format_bytes(pacman_cache) if isinstance(pacman_cache, int) and pacman_cache >= 0 else "unavailable")
+            self.package_cache_label + ": "
+            + (format_bytes(package_cache) if isinstance(package_cache, int) and package_cache >= 0 else "unavailable")
         )
         lines.append(
             "Log directory: " + (format_bytes(log_dir) if isinstance(log_dir, int) and log_dir >= 0 else "unavailable")
@@ -3768,6 +4373,13 @@ class DashboardModel:
     def __init__(self) -> None:
         self.backend = MonitorBackend()
         self.collectors = self._build_collectors()
+        self.tab_order = tuple(
+            tab for tab in BASE_TAB_ORDER if any(collector.tab == tab for collector in self.collectors)
+        )
+        self.tab_titles = {
+            tab: BASE_TAB_TITLES[tab]
+            for tab in self.tab_order
+        }
         self.states = {
             collector.key: SectionState(title=collector.title) for collector in self.collectors
         }
@@ -3777,12 +4389,11 @@ class DashboardModel:
 
     def _build_collectors(self) -> list[Collector]:
         backend = self.backend
-        return [
+        collectors = [
             Collector("top_problems", "tier1", "Top Problems", 15, backend.collect_top_problems),
             Collector("diff_snapshot", "tier1", "Diff Snapshot", 15, backend.collect_diff_snapshot),
             Collector("uptime", "tier1", "Uptime", 15, backend.collect_uptime),
             Collector("snapshot_health", "tier1", "Privileged Snapshot", 15, backend.collect_snapshot_health),
-            Collector("packages", "tier1", "Kernel / Firmware / NVIDIA", 5, backend.collect_packages),
             Collector("storage", "tier1", "Storage / Capacity", 20, backend.collect_storage),
             Collector("systemd", "tier1", "Systemd / Service Health", 20, backend.collect_systemd),
             Collector("logs", "tier1", "Logs / Errors", 20, backend.collect_logs),
@@ -3791,15 +4402,31 @@ class DashboardModel:
             Collector("thermal", "tier2", "Thermal / Power", 6, backend.collect_thermal),
             Collector("hardware", "tier2", "Hardware Health", 30, backend.collect_hardware),
             Collector("fs_integrity", "tier2", "Filesystem Integrity", 30, backend.collect_fs_integrity),
-            Collector("device_specific", "tier2", "Device-Specific Signals", 20, backend.collect_device_specific),
             Collector("network", "tier3", "Network State", 15, backend.collect_network),
             Collector("wifi", "tier3", "Wi-Fi Intelligence", 15, backend.collect_wifi),
+            Collector("bluetooth", "tier3", "Bluetooth", 20, backend.collect_bluetooth),
             Collector("security", "tier3", "Security / Exposure Surface", 30, backend.collect_security),
             Collector("hygiene", "tier3", "System Hygiene", 300, backend.collect_hygiene),
             Collector("boot", "tier3", "Boot / Regression Signals", 300, backend.collect_boot),
-            Collector("pending_updates", "packages", "Official Repo Updates", 15, backend.collect_pending_updates),
-            Collector("aur_updates", "aur", "AUR Updates", 15, backend.collect_aur_updates),
         ]
+        if backend.package_monitoring_enabled():
+            collectors.insert(
+                4,
+                Collector("packages", "tier1", "Kernel / Firmware / NVIDIA", 5, backend.collect_packages),
+            )
+            collectors.append(
+                Collector("pending_updates", "packages", "Official Repo Updates", 15, backend.collect_pending_updates)
+            )
+            if backend.supports_aur:
+                collectors.append(
+                    Collector("aur_updates", "aur", "AUR Updates", 15, backend.collect_aur_updates)
+                )
+        if backend.capture_monitoring_enabled():
+            collectors.insert(
+                12 if backend.package_monitoring_enabled() else 11,
+                Collector("device_specific", "tier2", "Device-Specific Signals", 20, backend.collect_device_specific),
+            )
+        return collectors
 
     def start_background_tasks(self) -> None:
         self.backend.start_package_worker()
@@ -3897,12 +4524,13 @@ class DashboardModel:
 class DashboardUI:
     def __init__(self, model: DashboardModel, initial_tab: str = "tier1") -> None:
         self.model = model
-        self.active_tab_index = max(TAB_ORDER.index(initial_tab), 0)
-        self.scroll_offsets = {tab: 0 for tab in TAB_ORDER}
+        initial = initial_tab if initial_tab in self.model.tab_order else self.model.tab_order[0]
+        self.active_tab_index = max(self.model.tab_order.index(initial), 0)
+        self.scroll_offsets = {tab: 0 for tab in self.model.tab_order}
 
     @property
     def active_tab(self) -> str:
-        return TAB_ORDER[self.active_tab_index]
+        return self.model.tab_order[self.active_tab_index]
 
     def run(self) -> None:
         curses.wrapper(self._main)
@@ -3940,9 +4568,9 @@ class DashboardUI:
             if key in (ord("q"), ord("Q")):
                 break
             if key in (curses.KEY_RIGHT, ord("l"), ord("\t")):
-                self.active_tab_index = (self.active_tab_index + 1) % len(TAB_ORDER)
+                self.active_tab_index = (self.active_tab_index + 1) % len(self.model.tab_order)
             elif key in (curses.KEY_LEFT, ord("h")):
-                self.active_tab_index = (self.active_tab_index - 1) % len(TAB_ORDER)
+                self.active_tab_index = (self.active_tab_index - 1) % len(self.model.tab_order)
             elif key in (curses.KEY_DOWN, ord("j")):
                 self.scroll_offsets[self.active_tab] += 1
             elif key in (curses.KEY_UP, ord("k")):
@@ -3980,7 +4608,7 @@ class DashboardUI:
             attr = self._line_attr(line, current_section)
             self._safe_addstr(stdscr, row, 0, line[: max(width - 1, 1)], attr)
         footer = (
-            f"{self.model.overall_status()} | {TAB_TITLES[self.active_tab]} "
+            f"{self.model.overall_status()} | {self.model.tab_titles[self.active_tab]} "
             f"| scroll {offset}/{max_offset}"
         )
         self._safe_addstr(stdscr, height - 1, 0, footer[: max(width - 1, 1)], curses.color_pair(4))
@@ -3988,8 +4616,8 @@ class DashboardUI:
 
     def _draw_tabs(self, stdscr: curses.window, width: int) -> None:
         col = 0
-        for index, tab in enumerate(TAB_ORDER):
-            label = f" {TAB_TITLES[tab]} "
+        for index, tab in enumerate(self.model.tab_order):
+            label = f" {self.model.tab_titles[tab]} "
             attr = self._tab_attr(tab, index == self.active_tab_index)
             self._safe_addstr(stdscr, 0, col, label[: max(width - col, 0)], attr)
             col += len(label) + 1
@@ -4266,9 +4894,12 @@ class DashboardUI:
 
 
 def print_once(model: DashboardModel, tab: str) -> None:
-    tabs = TAB_ORDER if tab == "all" else (tab,)
+    tabs = model.tab_order if tab == "all" else ((tab,) if tab in model.tab_order else ())
+    if tab != "all" and not tabs:
+        print(f"Tab '{tab}' is not available on this system.")
+        return
     for name in tabs:
-        print(f"=== {TAB_TITLES[name]} ===")
+        print(f"=== {model.tab_titles[name]} ===")
         for _collector, state in model.snapshot(name):
             print(f"[{state.title}]")
             for line in state.lines:
@@ -4287,7 +4918,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--tab",
-        choices=[*TAB_ORDER, "all"],
+        choices=[*BASE_TAB_ORDER, "all"],
         default="tier1",
         help="Initial tab for the TUI or the tab to print in --once mode.",
     )
@@ -4306,7 +4937,7 @@ def main() -> int:
     worker = threading.Thread(target=model.refresh_loop, daemon=True)
     worker.start()
     try:
-        DashboardUI(model, initial_tab=args.tab if args.tab in TAB_ORDER else "tier1").run()
+        DashboardUI(model, initial_tab=args.tab if args.tab in model.tab_order else model.tab_order[0]).run()
     finally:
         model.stop()
         worker.join(timeout=1.0)
