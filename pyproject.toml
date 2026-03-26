@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "monitor"
+version = "0.1.0"
+description = "Linux system monitoring and package cleanup TUIs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "hoff" },
+]
+dependencies = []
+
+[project.scripts]
+monitor-tui = "monitor.cli.monitor_tui:main"
+monitor-package-cleanup = "monitor.cli.package_cleanup:main"
+monitor-privileged-snapshot = "monitor.cli.privileged_snapshot:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

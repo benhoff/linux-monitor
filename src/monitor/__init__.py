@@ -1,0 +1,2 @@
+"""Monitor package scaffolding."""
+
