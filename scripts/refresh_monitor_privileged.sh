@@ -11,6 +11,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${SELF_PATH}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 SOURCE_SCRIPT="${REPO_ROOT}/bin/monitor_privileged_snapshot.py"
 SOURCE_PACKAGE_ROOT="${REPO_ROOT}/src/monitor"
+SOURCE_PACKAGE_INIT="${SOURCE_PACKAGE_ROOT}/__init__.py"
 SOURCE_APP_INIT="${SOURCE_PACKAGE_ROOT}/app/__init__.py"
 SOURCE_APP_PRIVILEGED="${SOURCE_PACKAGE_ROOT}/app/privileged_snapshot.py"
 SOURCE_SHARED_INIT="${SOURCE_PACKAGE_ROOT}/shared/__init__.py"
@@ -35,6 +36,13 @@ require_command() {
   fi
 }
 
+verify_installed_script() {
+  if ! python3 "${INSTALLED_SCRIPT}" --help >/dev/null 2>&1; then
+    printf 'Smoke test failed for %s\n' "${INSTALLED_SCRIPT}" >&2
+    exit 1
+  fi
+}
+
 main() {
   require_command python3
 
@@ -49,16 +57,21 @@ main() {
 
   if [[ -f "${SOURCE_SCRIPT}" ]]; then
     require_command install
+    if [[ ! -f "${SOURCE_PACKAGE_INIT}" || ! -f "${SOURCE_APP_INIT}" || ! -f "${SOURCE_APP_PRIVILEGED}" || ! -f "${SOURCE_SHARED_INIT}" || ! -f "${SOURCE_SHARED_CONSTANTS}" || ! -f "${SOURCE_SHARED_TEXT}" ]]; then
+      printf 'Could not find required package files under %s\n' "${SOURCE_PACKAGE_ROOT}" >&2
+      exit 1
+    fi
     install -d -m 0755 "${INSTALL_DIR}"
     install -d -m 0755 "${INSTALLED_APP_DIR}"
     install -d -m 0755 "${INSTALLED_SHARED_DIR}"
     install -m 0755 "${SOURCE_SCRIPT}" "${INSTALLED_SCRIPT}"
-    install -m 0644 "${SOURCE_PACKAGE_ROOT}/__init__.py" "${INSTALLED_PACKAGE_INIT}"
+    install -m 0644 "${SOURCE_PACKAGE_INIT}" "${INSTALLED_PACKAGE_INIT}"
     install -m 0644 "${SOURCE_APP_INIT}" "${INSTALLED_APP_INIT}"
     install -m 0644 "${SOURCE_APP_PRIVILEGED}" "${INSTALLED_APP_PRIVILEGED}"
     install -m 0644 "${SOURCE_SHARED_INIT}" "${INSTALLED_SHARED_INIT}"
     install -m 0644 "${SOURCE_SHARED_CONSTANTS}" "${INSTALLED_SHARED_CONSTANTS}"
     install -m 0644 "${SOURCE_SHARED_TEXT}" "${INSTALLED_SHARED_TEXT}"
+    verify_installed_script
     printf 'Updated %s from the current repo copy.\n' "${INSTALLED_SCRIPT}"
     printf 'Updated shared package under %s.\n' "${INSTALLED_PACKAGE_ROOT}"
   elif [[ ! -f "${INSTALLED_SCRIPT}" ]]; then

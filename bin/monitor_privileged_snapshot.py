@@ -5,9 +5,20 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-SRC_DIR = Path(__file__).resolve().parents[1] / "src"
-if SRC_DIR.exists():
-    sys.path.insert(0, str(SRC_DIR))
+
+def add_repo_src_to_path() -> None:
+    script_dir = Path(__file__).resolve().parent
+    for base_dir in (script_dir, *script_dir.parents):
+        src_dir = base_dir / "src"
+        if not (src_dir / "monitor" / "__init__.py").is_file():
+            continue
+        src_path = str(src_dir)
+        if src_path not in sys.path:
+            sys.path.insert(0, src_path)
+        return
+
+
+add_repo_src_to_path()
 
 from monitor.app.privileged_snapshot import main
 
