@@ -17,6 +17,11 @@ DOCKER_IMAGE_STALE_30_SECONDS = 30 * 86400
 DOCKER_IMAGE_STALE_90_SECONDS = 90 * 86400
 DOCKER_FLOATING_TAGS = frozenset({"latest"})
 DOCKER_ROOT_DIR = Path("/var/lib/docker")
+DOCKER_DISPLAY_CPU_PCT = 50.0
+DOCKER_DISPLAY_MEMORY_BYTES = 2 * 1024**3
+DOCKER_DISPLAY_WRITABLE_BYTES = 2 * 1024**3
+DOCKER_DISPLAY_LARGE_IMAGE_BYTES = 2 * 1024**3
+DOCKER_DISPLAY_STORAGE_BYTES = 1024**3
 
 
 class ContainersCollector:
@@ -498,6 +503,165 @@ class ContainersCollector:
             digest["top_writable_bytes"] = top_writable[0].get("size_bytes")
         return digest
 
+    def storage_line(self, state: dict[str, object]) -> str | None:
+        parts: list[str] = []
+        docker_data_bytes = state.get("docker_data_bytes")
+        reclaimable_bytes = state.get("reclaimable_bytes")
+        dangling_images = state.get("dangling_images")
+        dangling_volumes = state.get("dangling_volumes")
+
+        if isinstance(docker_data_bytes, int) and docker_data_bytes >= 0:
+            if docker_data_bytes >= DOCKER_DISPLAY_STORAGE_BYTES:
+                parts.append(f"docker data {format_bytes(docker_data_bytes)}")
+        if isinstance(reclaimable_bytes, int) and reclaimable_bytes > 0:
+            if reclaimable_bytes >= DOCKER_DISPLAY_STORAGE_BYTES:
+                parts.append(f"reclaimable {format_bytes(reclaimable_bytes)}")
+        if isinstance(dangling_images, int) and dangling_images > 0:
+            parts.append(f"{dangling_images} dangling images")
+        if isinstance(dangling_volumes, int) and dangling_volumes > 0:
+            parts.append(f"{dangling_volumes} dangling volumes")
+        if not parts:
+            return None
+        return "Storage: " + " | ".join(parts)
+
+    def runtime_line(self, state: dict[str, object]) -> str:
+        running = int(state.get("running", 0) or 0)
+        exited = int(state.get("exited", 0) or 0)
+        restarting = int(state.get("restarting", 0) or 0)
+        dead = int(state.get("dead", 0) or 0)
+        paused = int(state.get("paused", 0) or 0)
+        unhealthy = int(state.get("unhealthy", 0) or 0)
+        total_containers = state.get("total_containers")
+
+        parts = [f"{running} running"]
+        if unhealthy > 0:
+            parts.append(f"{unhealthy} unhealthy")
+        if restarting > 0:
+            parts.append(f"{restarting} restarting")
+        if dead > 0:
+            parts.append(f"{dead} dead")
+        if paused > 0:
+            parts.append(f"{paused} paused")
+        if exited > 0:
+            parts.append(f"{exited} exited")
+        elif running == 0 and total_containers == 0:
+            parts.append("no containers")
+        return "Runtime: " + " | ".join(parts)
+
+    def health_line(self, state: dict[str, object]) -> str | None:
+        unhealthy = int(state.get("unhealthy", 0) or 0)
+        health_starting = int(state.get("health_starting", 0) or 0)
+        healthy = int(state.get("healthy", 0) or 0)
+        missing_healthchecks = state.get("missing_healthchecks")
+
+        if unhealthy <= 0 and health_starting <= 0 and not (
+            isinstance(missing_healthchecks, int) and missing_healthchecks > 0
+        ):
+            return None
+
+        parts: list[str] = []
+        if unhealthy > 0:
+            parts.append(f"{unhealthy} unhealthy")
+        if health_starting > 0:
+            parts.append(f"{health_starting} starting")
+        if isinstance(missing_healthchecks, int) and missing_healthchecks > 0:
+            parts.append(f"{missing_healthchecks} without healthchecks")
+        elif healthy > 0 and unhealthy == 0 and health_starting == 0:
+            parts.append(f"{healthy} healthy")
+        if not parts:
+            return None
+        return "Health: " + " | ".join(parts)
+
+    def attention_line(self, state: dict[str, object]) -> str | None:
+        parts: list[str] = []
+
+        unhealthy_names = state.get("unhealthy_names", [])
+        if isinstance(unhealthy_names, list) and unhealthy_names:
+            parts.append("unhealthy " + summarize_list([str(item) for item in unhealthy_names], limit=3))
+
+        restarting_names = state.get("restarting_names", [])
+        if isinstance(restarting_names, list) and restarting_names:
+            parts.append("restarting " + summarize_list([str(item) for item in restarting_names], limit=3))
+
+        if not parts:
+            return None
+        return "Attention: " + " | ".join(parts)
+
+    def hotspot_line(self, state: dict[str, object]) -> str | None:
+        parts: list[str] = []
+
+        top_cpu = state.get("top_cpu", [])
+        if isinstance(top_cpu, list) and top_cpu:
+            item = top_cpu[0]
+            cpu_pct = float(item.get("cpu_pct", 0.0) or 0.0)
+            cpu_hogs = int(state.get("cpu_hogs", 0) or 0)
+            if cpu_pct >= DOCKER_DISPLAY_CPU_PCT:
+                label = f"cpu {shorten(str(item.get('name', '')), 24)} {cpu_pct:.0f}%"
+                if cpu_hogs > 1:
+                    label += f" (+{cpu_hogs - 1})"
+                parts.append(label)
+
+        top_memory = state.get("top_memory", [])
+        if isinstance(top_memory, list) and top_memory:
+            item = top_memory[0]
+            mem_bytes = int(item.get("mem_bytes", 0) or 0)
+            memory_hogs = int(state.get("memory_hogs", 0) or 0)
+            if mem_bytes >= DOCKER_DISPLAY_MEMORY_BYTES:
+                label = f"memory {shorten(str(item.get('name', '')), 24)} {format_bytes(mem_bytes)}"
+                if memory_hogs > 1:
+                    label += f" (+{memory_hogs - 1})"
+                parts.append(label)
+
+        top_writable = state.get("top_writable", [])
+        if isinstance(top_writable, list) and top_writable:
+            item = top_writable[0]
+            size_bytes = int(item.get("size_bytes", 0) or 0)
+            if size_bytes >= DOCKER_DISPLAY_WRITABLE_BYTES:
+                parts.append(
+                    f"writable {shorten(str(item.get('name', '')), 24)} {format_bytes(size_bytes)}"
+                )
+
+        if not parts:
+            return None
+        return "Hotspots: " + " | ".join(parts)
+
+    def freshness_line(self, state: dict[str, object]) -> str | None:
+        stale_30 = state.get("stale_images_30d")
+        stale_90 = state.get("stale_images_90d")
+        floating = state.get("floating_latest_tags")
+
+        parts: list[str] = []
+        if isinstance(stale_90, int) and stale_90 > 0:
+            parts.append(f"{stale_90} older than 90d")
+        if isinstance(stale_30, int) and stale_30 >= 3:
+            parts.append(f"{stale_30} older than 30d")
+        if isinstance(floating, int) and floating > 0:
+            parts.append(f"{floating} :latest tag(s)")
+        if not parts:
+            return None
+        return "Image hygiene: " + " | ".join(parts)
+
+    def large_images_line(self, state: dict[str, object]) -> str | None:
+        largest_images = state.get("largest_images", [])
+        if not isinstance(largest_images, list):
+            return None
+
+        rows = [
+            item
+            for item in largest_images
+            if isinstance(item, dict) and int(item.get("size_bytes", 0) or 0) >= DOCKER_DISPLAY_LARGE_IMAGE_BYTES
+        ]
+        if not rows:
+            return None
+
+        rendered = ", ".join(
+            f"{shorten(str(item.get('name', '')), 30)} {format_bytes(int(item.get('size_bytes', 0) or 0))} {self.age_label(item.get('age_seconds'))}"
+            for item in rows[:2]
+        )
+        if not rendered:
+            return None
+        return "Large images: " + rendered
+
     def collect(self) -> list[str]:
         state = self.state()
         lines: list[str] = []
@@ -511,126 +675,60 @@ class ContainersCollector:
             lines.append("Docker: not detected on this system.")
             return lines
 
-        access_line = "Docker access: "
+        access_line = "Docker: "
         access_error = str(state.get("access_error", "")).strip()
         service_value = state.get("docker_service")
         service_state = service_value.strip() if isinstance(service_value, str) else ""
+        access_parts: list[str] = []
         if state.get("source") == "snapshot":
-            access_line += "using privileged snapshot"
+            access_parts.append("using privileged snapshot")
             if access_error:
-                access_line += f" ({shorten(access_error, 100)})"
+                access_parts.append(shorten(access_error, 100))
         elif state.get("available"):
-            access_line += "daemon reachable"
+            access_parts.append("daemon reachable")
         elif access_error:
-            access_line += shorten(access_error, 120)
+            access_parts.append(shorten(access_error, 120))
         else:
-            access_line += "unavailable"
-        if service_state:
-            access_line += f" | docker.service {service_state}"
+            access_parts.append("unavailable")
+        if service_state and (service_state != "active" or state.get("source") == "snapshot"):
+            access_parts.append(f"docker.service {service_state}")
+        access_line += " | ".join(access_parts)
         lines.append(access_line)
 
-        if not state.get("available") and state.get("docker_data_bytes") is None:
+        if not state.get("available"):
+            storage_line = self.storage_line(state)
+            if storage_line:
+                lines.append(storage_line)
             notes = state.get("notes", [])
             if isinstance(notes, list) and notes:
                 lines.append("Notes: " + summarize_list([shorten(str(item), 80) for item in notes], limit=2))
             return lines
 
-        running = int(state.get("running", 0) or 0)
-        exited = int(state.get("exited", 0) or 0)
-        restarting = int(state.get("restarting", 0) or 0)
-        dead = int(state.get("dead", 0) or 0)
-        paused = int(state.get("paused", 0) or 0)
-        counts_line = f"Containers: {running} running | {exited} exited | {restarting} restarting | {dead} dead"
-        if paused > 0:
-            counts_line += f" | {paused} paused"
-        lines.append(counts_line)
+        lines.append(self.runtime_line(state))
 
-        unhealthy = int(state.get("unhealthy", 0) or 0)
-        healthy = int(state.get("healthy", 0) or 0)
-        health_starting = int(state.get("health_starting", 0) or 0)
-        missing_healthchecks = state.get("missing_healthchecks")
-        health_line = f"Health: {unhealthy} unhealthy | {healthy} healthy"
-        if health_starting > 0:
-            health_line += f" | {health_starting} starting"
-        if isinstance(missing_healthchecks, int):
-            health_line += f" | {missing_healthchecks} without healthchecks"
-        lines.append(health_line)
+        health_line = self.health_line(state)
+        if health_line:
+            lines.append(health_line)
 
-        unhealthy_names = state.get("unhealthy_names", [])
-        if isinstance(unhealthy_names, list) and unhealthy_names:
-            lines.append("Unhealthy: " + summarize_list([str(item) for item in unhealthy_names], limit=3))
-        restarting_names = state.get("restarting_names", [])
-        if isinstance(restarting_names, list) and restarting_names:
-            lines.append("Restarting: " + summarize_list([str(item) for item in restarting_names], limit=3))
+        attention_line = self.attention_line(state)
+        if attention_line:
+            lines.append(attention_line)
 
-        top_cpu = state.get("top_cpu", [])
-        if isinstance(top_cpu, list) and top_cpu:
-            lines.append(
-                "CPU hotspots: "
-                + ", ".join(
-                    f"{shorten(str(item.get('name', '')), 24)} {float(item.get('cpu_pct', 0.0)):.0f}%"
-                    for item in top_cpu[:3]
-                )
-            )
+        hotspot_line = self.hotspot_line(state)
+        if hotspot_line:
+            lines.append(hotspot_line)
 
-        top_memory = state.get("top_memory", [])
-        if isinstance(top_memory, list) and top_memory:
-            lines.append(
-                "Memory hotspots: "
-                + ", ".join(
-                    f"{shorten(str(item.get('name', '')), 24)} {format_bytes(int(item.get('mem_bytes', 0) or 0))}"
-                    for item in top_memory[:3]
-                )
-            )
+        storage_line = self.storage_line(state)
+        if storage_line:
+            lines.append(storage_line)
 
-        top_writable = state.get("top_writable", [])
-        if isinstance(top_writable, list) and top_writable:
-            lines.append(
-                "Writable layers: "
-                + ", ".join(
-                    f"{shorten(str(item.get('name', '')), 24)} {format_bytes(int(item.get('size_bytes', 0) or 0))}"
-                    for item in top_writable[:3]
-                )
-            )
+        freshness_line = self.freshness_line(state)
+        if freshness_line:
+            lines.append(freshness_line)
 
-        storage_parts: list[str] = []
-        docker_data_bytes = state.get("docker_data_bytes")
-        if isinstance(docker_data_bytes, int) and docker_data_bytes >= 0:
-            storage_parts.append(f"docker data {format_bytes(docker_data_bytes)}")
-        reclaimable_bytes = state.get("reclaimable_bytes")
-        if isinstance(reclaimable_bytes, int) and reclaimable_bytes > 0:
-            storage_parts.append(f"reclaimable {format_bytes(reclaimable_bytes)}")
-        dangling_images = state.get("dangling_images")
-        if isinstance(dangling_images, int) and dangling_images > 0:
-            storage_parts.append(f"{dangling_images} dangling images")
-        dangling_volumes = state.get("dangling_volumes")
-        if isinstance(dangling_volumes, int) and dangling_volumes > 0:
-            storage_parts.append(f"{dangling_volumes} dangling volumes")
-        lines.append("Storage: " + (" | ".join(storage_parts) if storage_parts else "unavailable"))
-
-        largest_images = state.get("largest_images", [])
-        if isinstance(largest_images, list) and largest_images:
-            lines.append(
-                "Largest images: "
-                + ", ".join(
-                    f"{shorten(str(item.get('name', '')), 34)} {format_bytes(int(item.get('size_bytes', 0) or 0))} {self.age_label(item.get('age_seconds') if isinstance(item, dict) else None)}"
-                    for item in largest_images[:3]
-                    if isinstance(item, dict)
-                )
-            )
-
-        stale_30 = state.get("stale_images_30d")
-        stale_90 = state.get("stale_images_90d")
-        floating = state.get("floating_latest_tags")
-        freshness_parts: list[str] = []
-        if isinstance(stale_30, int):
-            freshness_parts.append(f"{stale_30} older than 30d")
-        if isinstance(stale_90, int):
-            freshness_parts.append(f"{stale_90} older than 90d")
-        if isinstance(floating, int):
-            freshness_parts.append(f"{floating} :latest tag(s)")
-        if freshness_parts:
-            lines.append("Image freshness: " + " | ".join(freshness_parts))
+        large_images_line = self.large_images_line(state)
+        if large_images_line:
+            lines.append(large_images_line)
 
         notes = state.get("notes", [])
         if isinstance(notes, list) and notes:
