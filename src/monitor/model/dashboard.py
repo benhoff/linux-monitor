@@ -63,6 +63,8 @@ class DashboardModel:
             Collector("hygiene", "tier3", "System Hygiene", 300, backend.collect_hygiene),
             Collector("boot", "tier3", "Boot / Regression Signals", 300, backend.collect_boot),
         ]
+        if backend.container_monitoring_enabled():
+            collectors.insert(-2, Collector("containers", "tier3", "Containers / Docker", 45, backend.collect_containers))
         if backend.package_monitoring_enabled():
             collectors.insert(
                 4,

@@ -9,7 +9,7 @@ On systems with a supported package manager (`pacman` or `apt`) it groups the da
 
 - `Tier 1`: kernel/firmware/NVIDIA package tracking, storage, systemd health, journal errors
 - `Tier 2`: memory pressure, CPU/load, thermal state, hardware health, filesystem integrity, device-specific signals
-- `Tier 3`: network state, Wi-Fi intelligence, Bluetooth, exposure surface, hygiene, boot regressions
+- `Tier 3`: network state, Wi-Fi intelligence, Bluetooth, exposure surface, Docker/container hygiene, system hygiene, boot regressions
 - `Packages`: official repo update backlog with size totals, ETA, and per-package rows
 - `AUR`: AUR update backlog with size totals, ETA, and per-package rows on Arch systems with `yay`
 
@@ -116,6 +116,7 @@ monitor-tui --once --tab all
 - DNS probe targets and package-cache labels are distro-aware, so Debian-family systems use Debian/Ubuntu package and mirror conventions instead of Arch-specific ones.
 - Debian and Ubuntu package hygiene uses `apt`/`apt-mark` where available, while AUR-specific features stay Arch-only.
 - Tier 3 includes a `Bluetooth` panel that tracks service state, adapter/rfkill visibility, controller power/discoverability, connected and paired devices, and recent Bluetooth journal hints when those signals are available.
+- Tier 3 includes a `Containers / Docker` panel that surfaces unhealthy/restarting containers, CPU and memory hotspots, writable-layer and Docker-root storage growth, dangling leftovers, and local image-age hygiene signals.
 - Tier 3 `System Hygiene` now surfaces package-cache age/count, large watched directories, config drift under `/etc`, scheduled task hygiene, and container/VM leftovers.
 - Tier 3 `Security / Exposure Surface` now calls out services listening on non-loopback addresses before listing all sockets.
 
@@ -145,10 +146,27 @@ Refresh the installed privileged snapshot writer and force a new snapshot:
 ./scripts/refresh_monitor_privileged.sh
 ```
 
+Debug a missing, stale, unreadable, or mismatched privileged snapshot:
+
+```bash
+./scripts/debug_monitor_privileged.sh
+```
+
+The debug script checks the snapshot file, systemd service/timer state, unit `ExecStart`,
+path mismatches, freshness, permissions, and recent service logs, then prints concrete fix steps.
+`monitor-privileged-snapshot.service` is a `Type=oneshot` unit, so `inactive (dead)` after a
+successful run is normal; the timer should be enabled and active.
+
 If you installed the helper into `/usr/local/bin`, you can also run:
 
 ```bash
 monitor-privileged-refresh
+```
+
+If the debug helper was installed into `/usr/local/bin`, you can also run:
+
+```bash
+monitor-privileged-debug
 ```
 
 Use a different snapshot path:
@@ -163,5 +181,7 @@ Example systemd unit templates are in:
 - `packaging/systemd/monitor-privileged-snapshot.timer`
 
 The installer writes concrete unit files into `/etc/systemd/system` and prompts for `sudo` automatically.
-It also installs `monitor-privileged-refresh` into `/usr/local/bin` when `scripts/refresh_monitor_privileged.sh` is present in the repo.
-The repo-root `install_monitor_privileged.sh` and `refresh_monitor_privileged.sh` remain as compatibility wrappers.
+It also installs `monitor-privileged-refresh` and `monitor-privileged-debug` into `/usr/local/bin`
+when their scripts are present in the repo.
+The repo-root `install_monitor_privileged.sh`, `refresh_monitor_privileged.sh`, and
+`debug_monitor_privileged.sh` remain as compatibility wrappers.

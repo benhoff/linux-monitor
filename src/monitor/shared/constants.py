@@ -6,6 +6,7 @@ from pathlib import Path
 DEFAULT_PRIVILEGED_SNAPSHOT_PATH = Path("/run/monitor/privileged_snapshot.json")
 PRIVILEGED_SNAPSHOT_VERSION = 3
 DEFAULT_PRIVILEGED_SNAPSHOT_MAX_AGE = 15 * 60
+DEFAULT_PRIVILEGED_SNAPSHOT_MODE = 0o644
 
 PSEUDO_FILESYSTEMS = frozenset(
     {
@@ -41,4 +42,3 @@ FS_LOG_PATTERN = (
 )
 HARDWARE_LOG_PATTERN = r"gpu|drm|hdmi|edid|nvme|ata|usb|pci|v4l2|camera|csi"
 WIFI_LOG_PATTERN = r"wlan|wifi|wireless|wpa_supplicant|NetworkManager|cfg80211|mac80211"
-

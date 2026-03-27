@@ -14,6 +14,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 SOURCE_SCRIPT="${REPO_ROOT}/bin/monitor_privileged_snapshot.py"
 SOURCE_REFRESH="${SCRIPT_DIR}/refresh_monitor_privileged.sh"
+SOURCE_DEBUG="${SCRIPT_DIR}/debug_monitor_privileged.sh"
 SOURCE_PACKAGE_ROOT="${REPO_ROOT}/src/monitor"
 SOURCE_PACKAGE_INIT="${SOURCE_PACKAGE_ROOT}/__init__.py"
 SOURCE_APP_INIT="${SOURCE_PACKAGE_ROOT}/app/__init__.py"
@@ -32,6 +33,7 @@ INSTALLED_SHARED_INIT="${INSTALLED_SHARED_DIR}/__init__.py"
 INSTALLED_SHARED_CONSTANTS="${INSTALLED_SHARED_DIR}/constants.py"
 INSTALLED_SHARED_TEXT="${INSTALLED_SHARED_DIR}/text.py"
 INSTALLED_REFRESH="${BIN_DIR}/monitor-privileged-refresh"
+INSTALLED_DEBUG="${BIN_DIR}/monitor-privileged-debug"
 SERVICE_PATH="${SYSTEMD_DIR}/${SERVICE_NAME}"
 TIMER_PATH="${SYSTEMD_DIR}/${TIMER_NAME}"
 
@@ -118,6 +120,9 @@ main() {
   if [[ -f "${SOURCE_REFRESH}" ]]; then
     install -m 0755 "${SOURCE_REFRESH}" "${INSTALLED_REFRESH}"
   fi
+  if [[ -f "${SOURCE_DEBUG}" ]]; then
+    install -m 0755 "${SOURCE_DEBUG}" "${INSTALLED_DEBUG}"
+  fi
 
   verify_installed_script
 
@@ -132,6 +137,9 @@ main() {
   printf 'Installed shared package under %s\n' "${INSTALLED_PACKAGE_ROOT}"
   if [[ -f "${SOURCE_REFRESH}" ]]; then
     printf 'Installed %s\n' "${INSTALLED_REFRESH}"
+  fi
+  if [[ -f "${SOURCE_DEBUG}" ]]; then
+    printf 'Installed %s\n' "${INSTALLED_DEBUG}"
   fi
   printf 'Installed %s\n' "${SERVICE_PATH}"
   printf 'Installed %s\n' "${TIMER_PATH}"

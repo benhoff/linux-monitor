@@ -131,6 +131,7 @@ class DiffSnapshotService:
         snapshot_health = self.privileged_snapshots.health()
         wifi_digest = self.backend._wifi_digest()
         bluetooth_digest = self.backend._bluetooth_digest()
+        containers_digest = self.backend._docker_digest()
 
         capture_cards = self.backend.cached("capture_cards", 30.0, self.backend._capture_cards)
         avmatrix_cards = [card for card in capture_cards if "avmatrix" in card.lower()]
@@ -191,6 +192,7 @@ class DiffSnapshotService:
                 ),
                 "age": snapshot_health.get("age"),
             },
+            "containers": containers_digest,
             "wifi": wifi_digest,
             "bluetooth": bluetooth_digest,
             "capture": {
@@ -312,6 +314,64 @@ class DiffSnapshotService:
                 and current_version != previous_version
             ):
                 changes.append(f"Privileged snapshot schema: v{previous_version} -> v{current_version}")
+
+        current_containers = current.get("containers", {})
+        previous_containers = previous.get("containers", {})
+        if isinstance(current_containers, dict) and isinstance(previous_containers, dict):
+            current_unhealthy = current_containers.get("unhealthy")
+            previous_unhealthy = previous_containers.get("unhealthy")
+            if (
+                isinstance(current_unhealthy, int)
+                and isinstance(previous_unhealthy, int)
+                and current_unhealthy != previous_unhealthy
+            ):
+                changes.append(
+                    f"Docker unhealthy: {current_unhealthy - previous_unhealthy:+d} ({current_unhealthy} now)"
+                )
+            current_restarting = current_containers.get("restarting")
+            previous_restarting = previous_containers.get("restarting")
+            if (
+                isinstance(current_restarting, int)
+                and isinstance(previous_restarting, int)
+                and current_restarting != previous_restarting
+            ):
+                changes.append(
+                    f"Docker restarting: {current_restarting - previous_restarting:+d} ({current_restarting} now)"
+                )
+            current_dead = current_containers.get("dead")
+            previous_dead = previous_containers.get("dead")
+            if (
+                isinstance(current_dead, int)
+                and isinstance(previous_dead, int)
+                and current_dead != previous_dead
+            ):
+                changes.append(f"Docker dead: {current_dead - previous_dead:+d} ({current_dead} now)")
+            current_data = current_containers.get("docker_data_bytes")
+            previous_data = previous_containers.get("docker_data_bytes")
+            if isinstance(current_data, int) and isinstance(previous_data, int):
+                delta = current_data - previous_data
+                if abs(delta) >= 1024**3:
+                    changes.append(
+                        f"Docker data: {format_bytes(delta)} change ({format_bytes(current_data)} now)"
+                    )
+            current_reclaimable = current_containers.get("reclaimable_bytes")
+            previous_reclaimable = previous_containers.get("reclaimable_bytes")
+            if isinstance(current_reclaimable, int) and isinstance(previous_reclaimable, int):
+                delta = current_reclaimable - previous_reclaimable
+                if abs(delta) >= 1024**3:
+                    changes.append(
+                        f"Docker reclaimable: {format_bytes(delta)} change ({format_bytes(current_reclaimable)} now)"
+                    )
+            current_stale = current_containers.get("stale_images_90d")
+            previous_stale = previous_containers.get("stale_images_90d")
+            if (
+                isinstance(current_stale, int)
+                and isinstance(previous_stale, int)
+                and current_stale != previous_stale
+            ):
+                changes.append(
+                    f"Docker stale images (>90d): {current_stale - previous_stale:+d} ({current_stale} now)"
+                )
 
         current_wifi = current.get("wifi", {})
         previous_wifi = previous.get("wifi", {})

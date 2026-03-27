@@ -51,6 +51,7 @@ from monitor.shared.paths import diff_snapshot_state_path, legacy_repo_diff_snap
 from monitor.shared.text import line_list, parse_float, parse_int, read_lines, read_text, shorten
 from monitor.collectors.boot import BootCollector
 from monitor.collectors.capture import CaptureCollector
+from monitor.collectors.containers import ContainersCollector
 from monitor.collectors.hygiene import HygieneCollector
 from monitor.collectors.networking import BluetoothCollector, NetworkCollector, WifiCollector
 from monitor.collectors.package_monitor import PackageMonitor, PackageRefreshState, PackageUpdateRow
@@ -179,6 +180,7 @@ class MonitorBackend:
         self.logs = LogsCollector(self)
         self.package_monitor = PackageMonitor(self)
         self.capture = CaptureCollector(self)
+        self.containers = ContainersCollector(self)
         self.memory = MemoryCollector(self)
         self.network = NetworkCollector(self)
         self.wifi = WifiCollector(self)
@@ -235,6 +237,12 @@ class MonitorBackend:
     def _detect_capture_monitoring(self) -> bool:
         cards = self.cached("capture_cards", 30.0, self._capture_cards)
         return any("avmatrix" in card.lower() for card in cards)
+
+    def container_monitoring_enabled(self) -> bool:
+        return bool(self.cached("container_monitoring_enabled", 60.0, self._detect_container_monitoring))
+
+    def _detect_container_monitoring(self) -> bool:
+        return self.containers.detect_enabled()
 
     def cached(self, key: str, ttl: float, producer: Callable[[], object]) -> object:
         now = time.time()
@@ -348,6 +356,51 @@ class MonitorBackend:
             elif state_value in {"degraded", "failed"}:
                 problems.append((75, f"? System state is {state_value}"))
 
+        containers = current.get("containers", {})
+        if isinstance(containers, dict) and containers.get("detected"):
+            unhealthy = containers.get("unhealthy")
+            restarting = containers.get("restarting")
+            dead = containers.get("dead")
+            docker_data_bytes = containers.get("docker_data_bytes")
+            reclaimable_bytes = containers.get("reclaimable_bytes")
+            stale_images_90d = containers.get("stale_images_90d")
+            top_cpu_name = str(containers.get("top_cpu_name", "")).strip()
+            top_cpu_pct = containers.get("top_cpu_pct")
+            top_memory_name = str(containers.get("top_memory_name", "")).strip()
+            top_memory_bytes = containers.get("top_memory_bytes")
+            top_writable_name = str(containers.get("top_writable_name", "")).strip()
+            top_writable_bytes = containers.get("top_writable_bytes")
+
+            if isinstance(unhealthy, int) and unhealthy > 0:
+                severity = 100 if unhealthy >= 3 else 90
+                problems.append((severity, f"! Docker reports {unhealthy} unhealthy container(s)"))
+            if (
+                isinstance(restarting, int)
+                and restarting > 0
+                or isinstance(dead, int)
+                and dead > 0
+            ):
+                restarting_count = restarting if isinstance(restarting, int) else 0
+                dead_count = dead if isinstance(dead, int) else 0
+                problems.append((88, f"! Docker has {restarting_count} restarting and {dead_count} dead container(s)"))
+            if isinstance(top_cpu_pct, (int, float)) and float(top_cpu_pct) >= 80.0 and top_cpu_name:
+                problems.append((70, f"? Docker CPU hotspot: {top_cpu_name} at {float(top_cpu_pct):.0f}%"))
+            if isinstance(top_memory_bytes, int) and top_memory_bytes >= 2 * 1024**3 and top_memory_name:
+                problems.append((65, f"? Docker memory hotspot: {top_memory_name} using {format_bytes(top_memory_bytes)}"))
+            if isinstance(top_writable_bytes, int) and top_writable_bytes >= 2 * 1024**3 and top_writable_name:
+                problems.append((60, f"? Docker writable layer hotspot: {top_writable_name} at {format_bytes(top_writable_bytes)}"))
+            if isinstance(docker_data_bytes, int) and docker_data_bytes >= 50 * 1024**3:
+                problems.append((85, f"! Docker data uses {format_bytes(docker_data_bytes)}"))
+            elif isinstance(docker_data_bytes, int) and docker_data_bytes >= 25 * 1024**3:
+                problems.append((60, f"? Docker data uses {format_bytes(docker_data_bytes)}"))
+            if isinstance(reclaimable_bytes, int) and reclaimable_bytes >= 15 * 1024**3:
+                problems.append((70, f"? Docker has {format_bytes(reclaimable_bytes)} reclaimable space"))
+            elif isinstance(reclaimable_bytes, int) and reclaimable_bytes >= 5 * 1024**3:
+                problems.append((55, f"? Docker has {format_bytes(reclaimable_bytes)} reclaimable space"))
+            if isinstance(stale_images_90d, int) and stale_images_90d > 0:
+                severity = 65 if stale_images_90d >= 5 else 50
+                problems.append((severity, f"? Docker image freshness: {stale_images_90d} image(s) older than 90d"))
+
         memory = current.get("memory", {})
         if isinstance(memory, dict):
             used_pct = memory.get("used_pct")
@@ -383,8 +436,10 @@ class MonitorBackend:
             if status == "version_drift":
                 version_label = f"v{version}" if isinstance(version, int) else "missing"
                 problems.append((95, f"! Privileged snapshot schema drift ({version_label}, need v{expected})"))
+            elif status == "unreadable":
+                problems.append((90, "! Privileged snapshot is not readable by the current user"))
             elif status == "invalid":
-                problems.append((90, "! Privileged snapshot is unreadable"))
+                problems.append((90, "! Privileged snapshot contents are invalid"))
             elif status == "stale" and isinstance(age, int):
                 problems.append((65, f"? Privileged snapshot is stale ({self._age_label(age)} old)"))
 
@@ -927,6 +982,12 @@ class MonitorBackend:
 
     def collect_hygiene(self) -> list[str]:
         return self.hygiene.collect()
+
+    def _docker_digest(self) -> dict[str, object]:
+        return self.containers.digest()
+
+    def collect_containers(self) -> list[str]:
+        return self.containers.collect()
 
     def _boot_time(self) -> str:
         return self.boot.boot_time()

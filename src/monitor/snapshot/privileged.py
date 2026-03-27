@@ -63,8 +63,12 @@ class PrivilegedSnapshotService:
             return health
         try:
             raw = path.read_text(encoding="utf-8")
+        except PermissionError:
+            health["status"] = "unreadable"
+            health["reason"] = "snapshot exists but current user cannot read it"
+            return health
         except OSError as exc:
-            health["status"] = "invalid"
+            health["status"] = "unreadable"
             health["reason"] = str(exc)
             return health
         try:
@@ -183,9 +187,18 @@ class PrivilegedSnapshotService:
             lines.append("Refresh: monitor-privileged-refresh")
             return lines
 
+        if status == "unreadable":
+            lines.append("! Status: unreadable")
+            lines.append(f"! {reason or 'Snapshot exists but could not be read'}")
+            lines.append("! Privileged sections fell back to unprivileged probes")
+            lines.append(f"Path: {path}")
+            lines.append("Refresh: monitor-privileged-refresh")
+            return lines
+
         if status == "invalid":
             lines.append("! Status: invalid")
-            lines.append(f"! {reason or 'Snapshot is unreadable'}")
+            lines.append(f"! {reason or 'Snapshot contents are invalid'}")
+            lines.append("! Privileged sections fell back to unprivileged probes")
             lines.append(f"Path: {path}")
             lines.append("Refresh: monitor-privileged-refresh")
             return lines

@@ -342,7 +342,7 @@ class DashboardUI:
             return True
         if stripped.startswith("System state:") and any(token in lowered for token in ("degraded", "failed")):
             return True
-        if section == "Privileged Snapshot" and stripped.startswith("Status:") and any(token in lowered for token in ("invalid", "version drift")):
+        if section == "Privileged Snapshot" and stripped.startswith("Status:") and any(token in lowered for token in ("invalid", "unreadable", "version drift")):
             return True
         if section == "Storage / Capacity":
             if stripped.startswith("Filesystems:"):
