@@ -16,6 +16,7 @@ SOURCE_APP_INIT="${SOURCE_PACKAGE_ROOT}/app/__init__.py"
 SOURCE_APP_PRIVILEGED="${SOURCE_PACKAGE_ROOT}/app/privileged_snapshot.py"
 SOURCE_SHARED_INIT="${SOURCE_PACKAGE_ROOT}/shared/__init__.py"
 SOURCE_SHARED_CONSTANTS="${SOURCE_PACKAGE_ROOT}/shared/constants.py"
+SOURCE_SHARED_PARSING_NETWORK="${SOURCE_PACKAGE_ROOT}/shared/parsing_network.py"
 SOURCE_SHARED_TEXT="${SOURCE_PACKAGE_ROOT}/shared/text.py"
 INSTALLED_SCRIPT="${INSTALL_DIR}/monitor_privileged_snapshot.py"
 INSTALLED_PACKAGE_ROOT="${INSTALL_DIR}/src/monitor"
@@ -26,6 +27,7 @@ INSTALLED_SHARED_DIR="${INSTALLED_PACKAGE_ROOT}/shared"
 INSTALLED_PACKAGE_INIT="${INSTALLED_PACKAGE_ROOT}/__init__.py"
 INSTALLED_SHARED_INIT="${INSTALLED_SHARED_DIR}/__init__.py"
 INSTALLED_SHARED_CONSTANTS="${INSTALLED_SHARED_DIR}/constants.py"
+INSTALLED_SHARED_PARSING_NETWORK="${INSTALLED_SHARED_DIR}/parsing_network.py"
 INSTALLED_SHARED_TEXT="${INSTALLED_SHARED_DIR}/text.py"
 
 require_command() {
@@ -57,7 +59,7 @@ main() {
 
   if [[ -f "${SOURCE_SCRIPT}" ]]; then
     require_command install
-    if [[ ! -f "${SOURCE_PACKAGE_INIT}" || ! -f "${SOURCE_APP_INIT}" || ! -f "${SOURCE_APP_PRIVILEGED}" || ! -f "${SOURCE_SHARED_INIT}" || ! -f "${SOURCE_SHARED_CONSTANTS}" || ! -f "${SOURCE_SHARED_TEXT}" ]]; then
+    if [[ ! -f "${SOURCE_PACKAGE_INIT}" || ! -f "${SOURCE_APP_INIT}" || ! -f "${SOURCE_APP_PRIVILEGED}" || ! -f "${SOURCE_SHARED_INIT}" || ! -f "${SOURCE_SHARED_CONSTANTS}" || ! -f "${SOURCE_SHARED_PARSING_NETWORK}" || ! -f "${SOURCE_SHARED_TEXT}" ]]; then
       printf 'Could not find required package files under %s\n' "${SOURCE_PACKAGE_ROOT}" >&2
       exit 1
     fi
@@ -70,6 +72,7 @@ main() {
     install -m 0644 "${SOURCE_APP_PRIVILEGED}" "${INSTALLED_APP_PRIVILEGED}"
     install -m 0644 "${SOURCE_SHARED_INIT}" "${INSTALLED_SHARED_INIT}"
     install -m 0644 "${SOURCE_SHARED_CONSTANTS}" "${INSTALLED_SHARED_CONSTANTS}"
+    install -m 0644 "${SOURCE_SHARED_PARSING_NETWORK}" "${INSTALLED_SHARED_PARSING_NETWORK}"
     install -m 0644 "${SOURCE_SHARED_TEXT}" "${INSTALLED_SHARED_TEXT}"
     verify_installed_script
     printf 'Updated %s from the current repo copy.\n' "${INSTALLED_SCRIPT}"

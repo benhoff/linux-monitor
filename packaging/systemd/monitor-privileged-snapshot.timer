@@ -2,7 +2,6 @@
 Description=Refresh privileged monitor snapshot every 2 minutes
 
 [Timer]
-OnBootSec=30s
 OnUnitActiveSec=2min
 AccuracySec=15s
 Unit=monitor-privileged-snapshot.service

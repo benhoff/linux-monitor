@@ -21,6 +21,7 @@ SOURCE_APP_INIT="${SOURCE_PACKAGE_ROOT}/app/__init__.py"
 SOURCE_APP_PRIVILEGED="${SOURCE_PACKAGE_ROOT}/app/privileged_snapshot.py"
 SOURCE_SHARED_INIT="${SOURCE_PACKAGE_ROOT}/shared/__init__.py"
 SOURCE_SHARED_CONSTANTS="${SOURCE_PACKAGE_ROOT}/shared/constants.py"
+SOURCE_SHARED_PARSING_NETWORK="${SOURCE_PACKAGE_ROOT}/shared/parsing_network.py"
 SOURCE_SHARED_TEXT="${SOURCE_PACKAGE_ROOT}/shared/text.py"
 INSTALLED_SCRIPT="${INSTALL_DIR}/monitor_privileged_snapshot.py"
 INSTALLED_PACKAGE_ROOT="${INSTALL_DIR}/src/monitor"
@@ -31,6 +32,7 @@ INSTALLED_SHARED_DIR="${INSTALLED_PACKAGE_ROOT}/shared"
 INSTALLED_PACKAGE_INIT="${INSTALLED_PACKAGE_ROOT}/__init__.py"
 INSTALLED_SHARED_INIT="${INSTALLED_SHARED_DIR}/__init__.py"
 INSTALLED_SHARED_CONSTANTS="${INSTALLED_SHARED_DIR}/constants.py"
+INSTALLED_SHARED_PARSING_NETWORK="${INSTALLED_SHARED_DIR}/parsing_network.py"
 INSTALLED_SHARED_TEXT="${INSTALLED_SHARED_DIR}/text.py"
 INSTALLED_REFRESH="${BIN_DIR}/monitor-privileged-refresh"
 INSTALLED_DEBUG="${BIN_DIR}/monitor-privileged-debug"
@@ -74,7 +76,6 @@ write_timer() {
 Description=Refresh privileged monitor snapshot every ${REFRESH_INTERVAL}
 
 [Timer]
-OnBootSec=30s
 OnUnitActiveSec=${REFRESH_INTERVAL}
 AccuracySec=15s
 Unit=${SERVICE_NAME}
@@ -93,7 +94,7 @@ main() {
     printf 'Could not find %s\n' "${SOURCE_SCRIPT}" >&2
     exit 1
   fi
-  if [[ ! -f "${SOURCE_PACKAGE_INIT}" || ! -f "${SOURCE_APP_INIT}" || ! -f "${SOURCE_APP_PRIVILEGED}" || ! -f "${SOURCE_SHARED_INIT}" || ! -f "${SOURCE_SHARED_CONSTANTS}" || ! -f "${SOURCE_SHARED_TEXT}" ]]; then
+  if [[ ! -f "${SOURCE_PACKAGE_INIT}" || ! -f "${SOURCE_APP_INIT}" || ! -f "${SOURCE_APP_PRIVILEGED}" || ! -f "${SOURCE_SHARED_INIT}" || ! -f "${SOURCE_SHARED_CONSTANTS}" || ! -f "${SOURCE_SHARED_PARSING_NETWORK}" || ! -f "${SOURCE_SHARED_TEXT}" ]]; then
     printf 'Could not find required package files under %s\n' "${SOURCE_PACKAGE_ROOT}" >&2
     exit 1
   fi
@@ -116,6 +117,7 @@ main() {
   install -m 0644 "${SOURCE_APP_PRIVILEGED}" "${INSTALLED_APP_PRIVILEGED}"
   install -m 0644 "${SOURCE_SHARED_INIT}" "${INSTALLED_SHARED_INIT}"
   install -m 0644 "${SOURCE_SHARED_CONSTANTS}" "${INSTALLED_SHARED_CONSTANTS}"
+  install -m 0644 "${SOURCE_SHARED_PARSING_NETWORK}" "${INSTALLED_SHARED_PARSING_NETWORK}"
   install -m 0644 "${SOURCE_SHARED_TEXT}" "${INSTALLED_SHARED_TEXT}"
   if [[ -f "${SOURCE_REFRESH}" ]]; then
     install -m 0755 "${SOURCE_REFRESH}" "${INSTALLED_REFRESH}"
@@ -130,8 +132,8 @@ main() {
   write_timer
 
   systemctl daemon-reload
-  systemctl enable --now "${TIMER_NAME}"
-  systemctl start "${SERVICE_NAME}"
+  systemctl enable "${SERVICE_NAME}" "${TIMER_NAME}"
+  systemctl start "${SERVICE_NAME}" "${TIMER_NAME}"
 
   printf 'Installed %s\n' "${INSTALLED_SCRIPT}"
   printf 'Installed shared package under %s\n' "${INSTALLED_PACKAGE_ROOT}"
@@ -143,8 +145,9 @@ main() {
   fi
   printf 'Installed %s\n' "${SERVICE_PATH}"
   printf 'Installed %s\n' "${TIMER_PATH}"
+  printf 'Enabled %s to run at boot\n' "${SERVICE_NAME}"
   printf 'Enabled and started %s\n' "${TIMER_NAME}"
-  printf 'Ran %s once to write %s\n' "${SERVICE_NAME}" "${SNAPSHOT_OUTPUT}"
+  printf 'Started %s to write %s immediately\n' "${SERVICE_NAME}" "${SNAPSHOT_OUTPUT}"
 }
 
 main "$@"
