@@ -817,11 +817,23 @@ class PackageMonitor:
                 note_parts.append(" / ".join(errors))
             lines.append("  Package marks: " + " | ".join(note_parts))
         lines.append(f"  Tracked priority packages outdated: {tracked_outdated}/{len(tracked_rows)}")
-        lines.append(f"Kernel runtime: {running_kernel}")
+        runtime_parts = [f"kernel {running_kernel}"]
         if self.backend.nvidia_monitoring_enabled():
-            lines.append(f"NVIDIA runtime: {nvidia_module}")
+            runtime_parts.append(f"NVIDIA {nvidia_module}")
+        lines.append("  Runtime: " + " | ".join(runtime_parts))
+        interesting_group_lines: list[str] = []
         for title, rows in tracked_groups:
-            lines.extend(self.package_group_lines(title, rows, kernel_updates))
+            outdated_count = sum(
+                1
+                for name, version in rows
+                if (latest := self.latest_version_for(name, kernel_updates)) is not None and latest != version
+            )
+            if outdated_count > 0:
+                interesting_group_lines.extend(self.package_group_lines(title, rows, kernel_updates))
+        if interesting_group_lines:
+            lines.extend(interesting_group_lines)
+        else:
+            lines.append("  Tracked groups: all current")
         return lines
 
     def collect_update_backlog(self, source: str) -> list[str]:

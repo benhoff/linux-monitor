@@ -8,6 +8,7 @@ from pathlib import Path
 
 from monitor.shared.constants import PRIVILEGED_SNAPSHOT_VERSION
 from monitor.shared.formatting import format_bytes
+from monitor.shared.parsing_journal import summarize_journal_entries
 from monitor.shared.paths import diff_snapshot_state_path, legacy_repo_diff_snapshot_path
 
 
@@ -59,13 +60,13 @@ class DiffSnapshotService:
     def build_state_digest(self) -> dict[str, object]:
         now = time.time()
         installed = self.backend.cached("installed_packages", 30.0, self.backend._installed_packages)
-        with self.backend.package_lock:
-            package_state = {
-                "official_updates": dict(self.backend.package_state.official_updates),
-                "aur_updates": dict(self.backend.package_state.aur_updates),
-                "official_error": self.backend.package_state.official_error,
-                "aur_error": self.backend.package_state.aur_error,
-            }
+        package_state_snapshot = self.backend.package_monitor.package_state_snapshot()
+        package_state = {
+            "official_updates": dict(package_state_snapshot.official_updates),
+            "aur_updates": dict(package_state_snapshot.aur_updates),
+            "official_error": package_state_snapshot.official_error,
+            "aur_error": package_state_snapshot.aur_error,
+        }
 
         kernel_updates = {
             **package_state["aur_updates"],
@@ -113,7 +114,9 @@ class DiffSnapshotService:
         journal_error_count = None
         if privileged_logs:
             errors = privileged_logs.get("journal_errors", [])
-            journal_error_count = len(errors) if isinstance(errors, list) else None
+            if isinstance(errors, list):
+                summarized_errors = summarize_journal_entries(errors, limit=20)
+                journal_error_count = len(self.backend.logs.filtered_entries(summarized_errors, "journal_errors"))
 
         meminfo = self.backend._meminfo()
         mem_total = meminfo.get("MemTotal", 0) * 1024

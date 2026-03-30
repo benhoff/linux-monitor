@@ -261,14 +261,13 @@ class StorageCollector:
                 "Active devices: " + ", ".join(f"{name} {format_bytes(rate)}/s" for name, rate in active_devices)
             )
 
-        noisy_dirs = [(path, size) for path, size in dir_sizes if size >= 1024**3]
-        if noisy_dirs:
-            lines.append(
-                "Growth suspects: "
-                + ", ".join(
-                    f"{self.abbreviate_path(path)} {format_bytes(size)}" for path, size in noisy_dirs[:3]
+        if root_entry and (root_pct >= 75 or watch_count > 0 or critical_count > 0):
+            noisy_dirs = [(path, size) for path, size in dir_sizes if size >= 1024**3]
+            if noisy_dirs:
+                lines.append(
+                    "Large watched paths: "
+                    + ", ".join(
+                        f"{self.abbreviate_path(path)} {format_bytes(size)}" for path, size in noisy_dirs[:3]
+                    )
                 )
-            )
-        else:
-            lines.append("Growth suspects: none above 1 GiB in watched paths.")
         return lines

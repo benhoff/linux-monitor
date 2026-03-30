@@ -334,8 +334,8 @@ class MonitorBackend:
                 problems.append((severity, f"? {tracked_outdated} tracked priority packages are outdated"))
 
         storage = current.get("storage", {})
+        root_pct = storage.get("root_pct") if isinstance(storage, dict) else None
         if isinstance(storage, dict):
-            root_pct = storage.get("root_pct")
             critical_count = storage.get("critical_count")
             watch_count = storage.get("watch_count")
             if isinstance(root_pct, int) and root_pct >= 90:
@@ -390,14 +390,15 @@ class MonitorBackend:
                 problems.append((65, f"? Docker memory hotspot: {top_memory_name} using {format_bytes(top_memory_bytes)}"))
             if isinstance(top_writable_bytes, int) and top_writable_bytes >= 2 * 1024**3 and top_writable_name:
                 problems.append((60, f"? Docker writable layer hotspot: {top_writable_name} at {format_bytes(top_writable_bytes)}"))
-            if isinstance(docker_data_bytes, int) and docker_data_bytes >= 50 * 1024**3:
-                problems.append((85, f"! Docker data uses {format_bytes(docker_data_bytes)}"))
-            elif isinstance(docker_data_bytes, int) and docker_data_bytes >= 25 * 1024**3:
-                problems.append((60, f"? Docker data uses {format_bytes(docker_data_bytes)}"))
-            if isinstance(reclaimable_bytes, int) and reclaimable_bytes >= 15 * 1024**3:
-                problems.append((70, f"? Docker has {format_bytes(reclaimable_bytes)} reclaimable space"))
-            elif isinstance(reclaimable_bytes, int) and reclaimable_bytes >= 5 * 1024**3:
-                problems.append((55, f"? Docker has {format_bytes(reclaimable_bytes)} reclaimable space"))
+            if isinstance(root_pct, int) and root_pct >= 75:
+                if isinstance(docker_data_bytes, int) and docker_data_bytes >= 50 * 1024**3:
+                    problems.append((85, f"! Docker data uses {format_bytes(docker_data_bytes)}"))
+                elif isinstance(docker_data_bytes, int) and docker_data_bytes >= 25 * 1024**3:
+                    problems.append((60, f"? Docker data uses {format_bytes(docker_data_bytes)}"))
+                if isinstance(reclaimable_bytes, int) and reclaimable_bytes >= 15 * 1024**3:
+                    problems.append((70, f"? Docker has {format_bytes(reclaimable_bytes)} reclaimable space"))
+                elif isinstance(reclaimable_bytes, int) and reclaimable_bytes >= 5 * 1024**3:
+                    problems.append((55, f"? Docker has {format_bytes(reclaimable_bytes)} reclaimable space"))
             if isinstance(stale_images_90d, int) and stale_images_90d > 0:
                 severity = 65 if stale_images_90d >= 5 else 50
                 problems.append((severity, f"? Docker image freshness: {stale_images_90d} image(s) older than 90d"))
@@ -424,7 +425,7 @@ class MonitorBackend:
         logs = current.get("logs", {})
         if isinstance(logs, dict):
             journal_errors = logs.get("journal_errors")
-            if isinstance(journal_errors, int) and journal_errors > 0:
+            if isinstance(journal_errors, int) and journal_errors >= 3:
                 severity = 65 if journal_errors < 10 else 80
                 problems.append((severity, f"? Journal shows {journal_errors} error entries this boot"))
 
@@ -445,10 +446,12 @@ class MonitorBackend:
                 problems.append((65, f"? Privileged snapshot is stale ({self._age_label(age)} old)"))
 
         ethernet = current.get("ethernet", {})
+        ethernet_default_route_up = False
         if isinstance(ethernet, dict) and ethernet.get("present"):
             interface = str(ethernet.get("interface", "ethernet")).strip() or "ethernet"
             connected = bool(ethernet.get("connected"))
             default_route = bool(ethernet.get("default_route"))
+            ethernet_default_route_up = connected and default_route
             error_count = ethernet.get("error_count")
             drop_count = ethernet.get("drop_count")
             link_down_count = ethernet.get("link_down_count")
@@ -474,7 +477,7 @@ class MonitorBackend:
             signal = wifi.get("signal_dbm")
             ssid = str(wifi.get("ssid", "")).strip()
             beacon_loss = wifi.get("beacon_loss")
-            if blocked:
+            if blocked and not ethernet_default_route_up:
                 problems.append((85, "! Wi-Fi radio is rfkill-blocked"))
             elif connected and isinstance(signal, (int, float)):
                 if signal <= -78:
@@ -493,10 +496,6 @@ class MonitorBackend:
             connected_count = bluetooth.get("connected_count")
             issue_count = bluetooth.get("issue_count")
             if isinstance(adapter_count, int) and adapter_count > 0:
-                if blocked:
-                    problems.append((70, "? Bluetooth radio is rfkill-blocked"))
-                elif service_active == "active" and powered is False:
-                    problems.append((50, "? Bluetooth controller is present but powered off"))
                 if (
                     isinstance(issue_count, int)
                     and issue_count > 0
@@ -1040,11 +1039,6 @@ class MonitorBackend:
     def collect_boot(self) -> list[str]:
         return self.boot.collect()
 
-
-from monitor.model.dashboard import DashboardModel
-from monitor.tui.dashboard import DashboardUI, print_once
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Arch/Linux monitoring TUI with tiered tabs for system drift, health, and regressions."
@@ -1064,6 +1058,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    from monitor.model.dashboard import DashboardModel
+    from monitor.tui.dashboard import DashboardUI, print_once
+
     args = parse_args()
     model = DashboardModel()
     if args.once:
