@@ -37,20 +37,30 @@ class PackageCleanupUI:
         self.sort_mode = "reclaim"
         self.main_index = 0
         self.main_offset = 0
+        self.main_search_query = ""
+        self.main_search_input: str | None = None
         self.orphan_index = 0
         self.orphan_offset = 0
         self.protected_index = 0
         self.protected_offset = 0
         self.selected_roots: set[str] = set()
         self.orphan_deselected: set[str] = set()
+        self.orphan_search_query = ""
+        self.orphan_search_input: str | None = None
         self.detail_root: str | None = None
         self.confirm_plan: RemovalPlan | None = None
 
     def run(self) -> None:
-        curses.wrapper(self._main)
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            curses.wrapper(self._main)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
 
     def _main(self, stdscr: curses.window) -> None:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             curses.curs_set(0)
         except curses.error:
@@ -75,11 +85,21 @@ class PackageCleanupUI:
             if key == -1:
                 time.sleep(REFRESH_POLL_INTERVAL)
                 continue
+            if key == 3:
+                break
             if self.confirm_plan is not None:
                 if key in (ord("y"), ord("Y")):
                     self._perform_removal(stdscr)
                 elif key in (ord("n"), ord("N"), 27):
                     self.confirm_plan = None
+                continue
+            if self.mode == "main" and self.main_search_input is not None:
+                if not self._handle_main_key(key):
+                    continue
+                continue
+            if self.mode == "orphans" and self.orphan_search_input is not None:
+                if not self._handle_orphan_key(key):
+                    continue
                 continue
             if key in (ord("q"), ord("Q")):
                 if self.mode == "main":
@@ -119,9 +139,97 @@ class PackageCleanupUI:
             candidates.sort(key=lambda item: (item.reclaimable_size, item.root), reverse=True)
         return candidates
 
+    @staticmethod
+    def _matches_query(query: str, *parts: str) -> bool:
+        normalized = query.strip().lower()
+        if not normalized:
+            return True
+        tokens = [token for token in normalized.split() if token]
+        if not tokens:
+            return True
+        haystack = " ".join(part for part in parts if part).lower()
+        return all(token in haystack for token in tokens)
+
+    def _main_candidates(self, snapshot: RefreshSnapshot) -> list[CandidatePreview]:
+        candidates = self._sorted_candidates(snapshot)
+        if not self.main_search_query.strip():
+            return candidates
+        filtered: list[CandidatePreview] = []
+        for candidate in candidates:
+            pkg = snapshot.packages.get(candidate.root)
+            description = pkg.description if pkg is not None else ""
+            if self._matches_query(self.main_search_query, candidate.root, description):
+                filtered.append(candidate)
+        return filtered
+
+    @staticmethod
+    def _candidate_index(candidates: list[CandidatePreview], root: str | None) -> int:
+        if root is None:
+            return 0
+        for index, candidate in enumerate(candidates):
+            if candidate.root == root:
+                return index
+        return 0
+
+    @staticmethod
+    def _package_index(rows: list[PackageInfo], name: str | None) -> int:
+        if name is None:
+            return 0
+        for index, pkg in enumerate(rows):
+            if pkg.name == name:
+                return index
+        return 0
+
+    @staticmethod
+    def _edit_search_input(value: str, key: int) -> tuple[str, bool, bool]:
+        if key in (10, 13, curses.KEY_ENTER):
+            return value, True, False
+        if key == 27:
+            return value, False, True
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            return value[:-1], False, False
+        if key == 21:
+            return "", False, False
+        if 0 <= key <= 255:
+            char = chr(key)
+            if char.isprintable():
+                return value + char, False, False
+        return value, False, False
+
+    @staticmethod
+    def _is_clear_search_key(key: int) -> bool:
+        return key in (27, 21)
+
+    def _current_main_root(self, snapshot: RefreshSnapshot) -> str | None:
+        candidates = self._main_candidates(snapshot)
+        if not candidates:
+            return None
+        return candidates[min(self.main_index, len(candidates) - 1)].root
+
+    def _set_main_search_query(
+        self,
+        snapshot: RefreshSnapshot,
+        query: str,
+        anchor_root: str | None = None,
+    ) -> None:
+        self.main_search_query = query.strip()
+        self.main_search_input = None
+        candidates = self._main_candidates(snapshot)
+        self.main_index = self._candidate_index(candidates, anchor_root)
+        self.main_offset = 0
+
+    def _clear_main_search(self, snapshot: RefreshSnapshot) -> None:
+        self._set_main_search_query(snapshot, "", anchor_root=self._current_main_root(snapshot))
+
     def _handle_main_key(self, key: int) -> bool:
         snapshot, _message = self.model.current_snapshot()
-        candidates = self._sorted_candidates(snapshot)
+        if self.main_search_input is not None:
+            return self._handle_main_search_key(key)
+        all_candidates = self._sorted_candidates(snapshot)
+        candidates = self._main_candidates(snapshot)
+        if self.main_search_query and self._is_clear_search_key(key):
+            self._clear_main_search(snapshot)
+            return True
         if key in (curses.KEY_DOWN, ord("j")):
             if candidates:
                 self.main_index = min(self.main_index + 1, len(candidates) - 1)
@@ -147,7 +255,10 @@ class PackageCleanupUI:
                 else:
                     self.selected_roots.add(root)
         elif key in (ord("c"), ord("C")):
-            self.selected_roots.clear()
+            if self.main_search_query:
+                self.selected_roots.difference_update(candidate.root for candidate in candidates)
+            else:
+                self.selected_roots.clear()
         elif key in (ord("s"), ord("S")):
             self.sort_mode = {"reclaim": "size", "size": "name", "name": "reclaim"}[self.sort_mode]
         elif key in (ord("m"), ord("M")):
@@ -155,16 +266,39 @@ class PackageCleanupUI:
                 root = candidates[self.main_index].root
                 self.selected_roots.discard(root)
                 self.model.protect_package(root)
+        elif key == ord("/"):
+            self.main_search_input = self.main_search_query
         elif key in (ord("o"), ord("O")):
             self.mode = "orphans"
         elif key in (ord("p"), ord("P")):
             self.mode = "protected"
         elif key in (ord("x"), ord("X")):
-            roots = [root for root in self.selected_roots if root in snapshot.candidates]
+            if self.main_search_query:
+                roots = [candidate.root for candidate in candidates if candidate.root in self.selected_roots]
+            else:
+                roots = [root for root in self.selected_roots if root in snapshot.candidates]
             if not roots and candidates:
                 roots = [candidates[self.main_index].root]
             if roots:
                 self._open_confirmation(snapshot, roots)
+        return True
+
+    def _handle_main_search_key(self, key: int) -> bool:
+        if self.main_search_input is None:
+            return True
+        snapshot, _message = self.model.current_snapshot()
+        input_value, apply_query, cancel = self._edit_search_input(self.main_search_input, key)
+        if apply_query:
+            self._set_main_search_query(
+                snapshot,
+                input_value,
+                anchor_root=self._current_main_root(snapshot),
+            )
+            return True
+        if cancel:
+            self.main_search_input = None
+            return True
+        self.main_search_input = input_value
         return True
 
     def _handle_detail_key(self, key: int) -> bool:
@@ -190,7 +324,7 @@ class PackageCleanupUI:
             self._open_confirmation(snapshot, [self.detail_root])
         return True
 
-    def _orphan_rows(self, snapshot: RefreshSnapshot) -> list[PackageInfo]:
+    def _all_orphan_rows(self, snapshot: RefreshSnapshot) -> list[PackageInfo]:
         protected = set(self.model.user_protected)
         rows = [
             pkg
@@ -203,12 +337,43 @@ class PackageCleanupUI:
         rows.sort(key=lambda item: (0 if item.official else 1, -item.installed_size, item.name))
         return rows
 
+    def _orphan_rows(self, snapshot: RefreshSnapshot) -> list[PackageInfo]:
+        rows = self._all_orphan_rows(snapshot)
+        return [pkg for pkg in rows if self._matches_query(self.orphan_search_query, pkg.name, pkg.description)]
+
+    def _current_orphan_name(self, snapshot: RefreshSnapshot) -> str | None:
+        rows = self._orphan_rows(snapshot)
+        if not rows:
+            return None
+        return rows[min(self.orphan_index, len(rows) - 1)].name
+
+    def _set_orphan_search_query(
+        self,
+        snapshot: RefreshSnapshot,
+        query: str,
+        anchor_name: str | None = None,
+    ) -> None:
+        self.orphan_search_query = query.strip()
+        self.orphan_search_input = None
+        rows = self._orphan_rows(snapshot)
+        self.orphan_index = self._package_index(rows, anchor_name)
+        self.orphan_offset = 0
+
+    def _clear_orphan_search(self, snapshot: RefreshSnapshot) -> None:
+        self._set_orphan_search_query(snapshot, "", anchor_name=self._current_orphan_name(snapshot))
+
     def _selected_orphan_names(self, rows: list[PackageInfo]) -> list[str]:
         return [pkg.name for pkg in rows if pkg.name not in self.orphan_deselected]
 
     def _handle_orphan_key(self, key: int) -> bool:
         snapshot, _message = self.model.current_snapshot()
+        if self.orphan_search_input is not None:
+            return self._handle_orphan_search_key(key)
+        all_rows = self._all_orphan_rows(snapshot)
         rows = self._orphan_rows(snapshot)
+        if self.orphan_search_query and self._is_clear_search_key(key):
+            self._clear_orphan_search(snapshot)
+            return True
         if key in (27, curses.KEY_BACKSPACE, ord("h"), ord("q"), ord("Q")):
             self.mode = "main"
             return True
@@ -232,19 +397,40 @@ class PackageCleanupUI:
             else:
                 self.orphan_deselected.add(name)
         elif key in (ord("a"), ord("A")):
-            self.orphan_deselected.clear()
+            self.orphan_deselected.difference_update(pkg.name for pkg in rows)
         elif key in (ord("c"), ord("C")):
             self.orphan_deselected.update(pkg.name for pkg in rows)
         elif key in (ord("m"), ord("M")) and rows:
             name = rows[self.orphan_index].name
             self.orphan_deselected.discard(name)
             self.model.protect_package(name)
+        elif key == ord("/"):
+            self.orphan_search_input = self.orphan_search_query
         elif key in (ord("x"), ord("X")):
-            roots = self._selected_orphan_names(rows)
+            target_rows = rows if self.orphan_search_query else all_rows
+            roots = self._selected_orphan_names(target_rows)
             if roots:
                 self._open_confirmation(snapshot, roots, official_only=False)
             else:
                 self.model.set_message("No orphan packages selected.", ttl=12.0)
+        return True
+
+    def _handle_orphan_search_key(self, key: int) -> bool:
+        if self.orphan_search_input is None:
+            return True
+        snapshot, _message = self.model.current_snapshot()
+        input_value, apply_query, cancel = self._edit_search_input(self.orphan_search_input, key)
+        if apply_query:
+            self._set_orphan_search_query(
+                snapshot,
+                input_value,
+                anchor_name=self._current_orphan_name(snapshot),
+            )
+            return True
+        if cancel:
+            self.orphan_search_input = None
+            return True
+        self.orphan_search_input = input_value
         return True
 
     def _handle_protected_key(self, key: int) -> bool:
@@ -326,10 +512,11 @@ class PackageCleanupUI:
         self.confirm_plan = plan
 
     def _draw_main(self, stdscr: curses.window, snapshot: RefreshSnapshot, message: str, height: int, width: int) -> None:
-        candidates = self._sorted_candidates(snapshot)
+        all_candidates = self._sorted_candidates(snapshot)
+        candidates = self._main_candidates(snapshot)
         if self.main_index >= len(candidates):
             self.main_index = max(len(candidates) - 1, 0)
-        body_height = max(height - 6, 1)
+        body_height = max(height - 7, 1)
         max_offset = max(len(candidates) - body_height, 0)
         if self.main_index < self.main_offset:
             self.main_offset = self.main_index
@@ -339,10 +526,24 @@ class PackageCleanupUI:
 
         title = "Package Cleanup TUI"
         subtitle = "Official installed packages only | unsafe packages hidden | multiselect bulk removal"
-        help_text = "Space mark | x remove marked/current | c clear marks | o orphans | Enter inspect | m protect | p protected | s sort | r refresh | q quit"
+        search_value = self.main_search_input if self.main_search_input is not None else self.main_search_query
+        if self.main_search_input is not None:
+            search_line = f"Search: /{search_value}_ | Enter apply | Esc cancel | Ctrl+u clear | Backspace delete"
+        elif self.main_search_query:
+            search_line = f"Search: /{search_value} | filtered by package or description | Esc clear"
+        else:
+            search_line = "Search: / to filter by package or description"
+        if self.main_search_input is not None:
+            help_text = "Search editor | type to update the filter draft | Enter apply | Esc cancel | Ctrl+u clear"
+        elif self.main_search_query:
+            help_text = "Space mark | x remove shown marked/current | c clear shown marks | / edit search | Esc clear search | o orphans | Enter inspect | m protect | p protected | s sort | r refresh | q quit"
+        else:
+            help_text = "Space mark | x remove marked/current | c clear marks | / search | o orphans | Enter inspect | m protect | p protected | s sort | r refresh | q quit"
         self._safe_addstr(stdscr, 0, 0, title[: max(width - 1, 1)], curses.color_pair(2) | curses.A_BOLD)
         self._safe_addstr(stdscr, 1, 0, subtitle[: max(width - 1, 1)], curses.A_DIM)
-        self._safe_addstr(stdscr, 2, 0, help_text[: max(width - 1, 1)], curses.A_DIM)
+        search_attr = curses.color_pair(5) | curses.A_BOLD if search_value or self.main_search_input is not None else curses.A_DIM
+        self._safe_addstr(stdscr, 2, 0, search_line[: max(width - 1, 1)], search_attr)
+        self._safe_addstr(stdscr, 3, 0, help_text[: max(width - 1, 1)], curses.A_DIM)
 
         marker_width = 3
         name_width = max(min(width // 4, 28), 18)
@@ -356,16 +557,16 @@ class PackageCleanupUI:
             size_label = "Reclaim"
         desc_width = max(width - marker_width - name_width - size_width - (3 if size_width else 2), 20)
         header_attr = curses.color_pair(5) | curses.A_BOLD
-        self._safe_addstr(stdscr, 3, 0, "Sel"[:marker_width], header_attr)
-        self._safe_addstr(stdscr, 3, marker_width + 1, "Package"[:name_width], header_attr)
+        self._safe_addstr(stdscr, 4, 0, "Sel"[:marker_width], header_attr)
+        self._safe_addstr(stdscr, 4, marker_width + 1, "Package"[:name_width], header_attr)
         size_col = marker_width + name_width + 2
         desc_col = marker_width + name_width + 2
         if size_width:
-            self._safe_addstr(stdscr, 3, size_col, size_label[:size_width], header_attr)
+            self._safe_addstr(stdscr, 4, size_col, size_label[:size_width], header_attr)
             desc_col = marker_width + name_width + size_width + 3
-        self._safe_addstr(stdscr, 3, desc_col, "Description"[:desc_width], header_attr)
+        self._safe_addstr(stdscr, 4, desc_col, "Description"[:desc_width], header_attr)
         visible = candidates[self.main_offset : self.main_offset + body_height]
-        for row, preview in enumerate(visible, start=4):
+        for row, preview in enumerate(visible, start=5):
             selected = candidates[self.main_index].root == preview.root if candidates else False
             pkg = snapshot.packages.get(preview.root)
             marker = "[x]" if preview.root in self.selected_roots else "[ ]"
@@ -383,13 +584,25 @@ class PackageCleanupUI:
                 self._safe_addstr(stdscr, row, size_col, size_value.rjust(size_width), attr)
             self._safe_addstr(stdscr, row, desc_col, desc, attr)
 
-        status_parts = [
-            snapshot.status,
-            f"sort {self.sort_mode}",
-            format_count(len(candidates), "candidate"),
-            f"selected {len(self.selected_roots)}",
-            f"protected {len(self.model.user_protected)}",
-        ]
+        if not candidates:
+            empty_label = (
+                f"No candidates match /{self.main_search_query}."
+                if self.main_search_query
+                else "No removable package candidates."
+            )
+            self._safe_addstr(stdscr, 5, 0, empty_label[: max(width - 1, 1)], curses.A_DIM)
+
+        shown_selected = sum(1 for candidate in candidates if candidate.root in self.selected_roots)
+        total_selected = sum(1 for candidate in all_candidates if candidate.root in self.selected_roots)
+        status_parts = [snapshot.status, f"sort {self.sort_mode}"]
+        if self.main_search_query:
+            status_parts.append(f"shown {len(candidates)}/{len(all_candidates)}")
+            status_parts.append(f"selected {shown_selected} shown")
+            status_parts.append(f"total selected {total_selected}")
+        else:
+            status_parts.append(format_count(len(candidates), "candidate"))
+            status_parts.append(f"selected {total_selected}")
+        status_parts.append(f"protected {len(self.model.user_protected)}")
         if candidates:
             selected = candidates[self.main_index]
             pkg = snapshot.packages.get(selected.root)
@@ -455,10 +668,11 @@ class PackageCleanupUI:
         self._safe_addstr(stdscr, height - 1, 0, footer[: max(width - 1, 1)], curses.color_pair(4))
 
     def _draw_orphans(self, stdscr: curses.window, snapshot: RefreshSnapshot, message: str, height: int, width: int) -> None:
+        all_rows = self._all_orphan_rows(snapshot)
         rows = self._orphan_rows(snapshot)
         if self.orphan_index >= len(rows):
             self.orphan_index = max(len(rows) - 1, 0)
-        body_height = max(height - 6, 1)
+        body_height = max(height - 7, 1)
         max_offset = max(len(rows) - body_height, 0)
         if self.orphan_index < self.orphan_offset:
             self.orphan_offset = self.orphan_index
@@ -467,13 +681,28 @@ class PackageCleanupUI:
         self.orphan_offset = min(self.orphan_offset, max_offset)
 
         selected_names = self._selected_orphan_names(rows)
+        total_selected_names = self._selected_orphan_names(all_rows)
         selected_size = sum(snapshot.packages[name].installed_size for name in selected_names if name in snapshot.packages)
         title = "Orphan Packages"
         subtitle = "Dependency-installed packages with no reverse deps. All are selected by default."
-        help_text = "Space unselect/reselect | x remove selected | a select all | c clear all | m protect | q back"
+        search_value = self.orphan_search_input if self.orphan_search_input is not None else self.orphan_search_query
+        if self.orphan_search_input is not None:
+            search_line = f"Search: /{search_value}_ | Enter apply | Esc cancel | Ctrl+u clear | Backspace delete"
+        elif self.orphan_search_query:
+            search_line = f"Search: /{search_value} | filtered by package or description | Esc clear"
+        else:
+            search_line = "Search: / to filter by package or description"
+        if self.orphan_search_input is not None:
+            help_text = "Search editor | type to update the filter draft | Enter apply | Esc cancel | Ctrl+u clear"
+        elif self.orphan_search_query:
+            help_text = "Space toggle | x remove shown selected | a select shown | c clear shown | / edit search | Esc clear search | m protect | q back"
+        else:
+            help_text = "Space toggle | x remove shown selected | a select shown | c clear shown | / search | m protect | q back"
         self._safe_addstr(stdscr, 0, 0, title[: max(width - 1, 1)], curses.color_pair(2) | curses.A_BOLD)
         self._safe_addstr(stdscr, 1, 0, subtitle[: max(width - 1, 1)], curses.A_DIM)
-        self._safe_addstr(stdscr, 2, 0, help_text[: max(width - 1, 1)], curses.A_DIM)
+        search_attr = curses.color_pair(5) | curses.A_BOLD if search_value or self.orphan_search_input is not None else curses.A_DIM
+        self._safe_addstr(stdscr, 2, 0, search_line[: max(width - 1, 1)], search_attr)
+        self._safe_addstr(stdscr, 3, 0, help_text[: max(width - 1, 1)], curses.A_DIM)
 
         marker_width = 3
         repo_width = 4
@@ -481,16 +710,16 @@ class PackageCleanupUI:
         size_width = 10
         desc_width = max(width - marker_width - repo_width - name_width - size_width - 5, 18)
         header_attr = curses.color_pair(5) | curses.A_BOLD
-        self._safe_addstr(stdscr, 3, 0, "Sel"[:marker_width], header_attr)
-        self._safe_addstr(stdscr, 3, marker_width + 1, "Repo"[:repo_width], header_attr)
-        self._safe_addstr(stdscr, 3, marker_width + repo_width + 2, "Package"[:name_width], header_attr)
+        self._safe_addstr(stdscr, 4, 0, "Sel"[:marker_width], header_attr)
+        self._safe_addstr(stdscr, 4, marker_width + 1, "Repo"[:repo_width], header_attr)
+        self._safe_addstr(stdscr, 4, marker_width + repo_width + 2, "Package"[:name_width], header_attr)
         size_col = marker_width + repo_width + name_width + 3
         desc_col = size_col + size_width + 1
-        self._safe_addstr(stdscr, 3, size_col, "Size"[:size_width], header_attr)
-        self._safe_addstr(stdscr, 3, desc_col, "Description"[:desc_width], header_attr)
+        self._safe_addstr(stdscr, 4, size_col, "Size"[:size_width], header_attr)
+        self._safe_addstr(stdscr, 4, desc_col, "Description"[:desc_width], header_attr)
 
         visible = rows[self.orphan_offset : self.orphan_offset + body_height]
-        for row, pkg in enumerate(visible, start=4):
+        for row, pkg in enumerate(visible, start=5):
             selected = rows[self.orphan_index].name == pkg.name if rows else False
             marker = "[ ]" if pkg.name in self.orphan_deselected else "[x]"
             repo = "off" if pkg.official else "aur"
@@ -502,14 +731,22 @@ class PackageCleanupUI:
             self._safe_addstr(stdscr, row, desc_col, pkg.description[: desc_width - 1], attr)
 
         if not rows:
-            self._safe_addstr(stdscr, 4, 0, "No orphan packages.", curses.A_DIM)
+            empty_label = (
+                f"No orphan packages match /{self.orphan_search_query}."
+                if self.orphan_search_query
+                else "No orphan packages."
+            )
+            self._safe_addstr(stdscr, 5, 0, empty_label[: max(width - 1, 1)], curses.A_DIM)
 
-        status_parts = [
-            snapshot.status,
-            format_count(len(rows), "orphan"),
-            f"selected {len(selected_names)}",
-            f"size {format_bytes(selected_size)}",
-        ]
+        status_parts = [snapshot.status]
+        if self.orphan_search_query:
+            status_parts.append(f"shown {len(rows)}/{len(all_rows)}")
+            status_parts.append(f"selected {len(selected_names)} shown")
+            status_parts.append(f"total selected {len(total_selected_names)}")
+        else:
+            status_parts.append(format_count(len(rows), "orphan"))
+            status_parts.append(f"selected {len(selected_names)}")
+        status_parts.append(f"size {format_bytes(selected_size)}")
         footer = " | ".join(status_parts)
         if message:
             footer = f"{footer} | {message}"
@@ -626,4 +863,3 @@ class PackageCleanupUI:
             window.addnstr(y, x, text, max(len(text), 0), attr)
         except curses.error:
             pass
-

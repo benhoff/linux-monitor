@@ -22,10 +22,16 @@ class DashboardUI:
         return self.model.tab_order[self.active_tab_index]
 
     def run(self) -> None:
-        curses.wrapper(self._main)
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            curses.wrapper(self._main)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
 
     def _main(self, stdscr: curses.window) -> None:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             curses.curs_set(0)
         except curses.error:
@@ -54,7 +60,7 @@ class DashboardUI:
             if key == -1:
                 time.sleep(0.05)
                 continue
-            if key in (ord("q"), ord("Q")):
+            if key in (3, ord("q"), ord("Q")):
                 break
             if key in (curses.KEY_RIGHT, ord("l"), ord("\t")):
                 self.active_tab_index = (self.active_tab_index + 1) % len(self.model.tab_order)
@@ -90,7 +96,7 @@ class DashboardUI:
             self.scroll_offsets[self.active_tab] = max_offset
         offset = self.scroll_offsets[self.active_tab]
         visible = lines[offset : offset + body_height]
-        current_section = ""
+        current_section = self._section_at_offset(lines, offset)
         for row, line in enumerate(visible, start=body_top):
             if line.startswith("[") and "]" in line:
                 current_section = line.split("]", 1)[0].lstrip("[")
@@ -114,6 +120,14 @@ class DashboardUI:
     def _draw_help(self, stdscr: curses.window, width: int) -> None:
         help_text = "Left/Right switch tabs | Up/Down scroll | r refresh | s sort package tabs | q quit | green ok | yellow watch | red problem"
         self._safe_addstr(stdscr, 1, 0, help_text[: max(width - 1, 1)], curses.A_DIM)
+
+    @staticmethod
+    def _section_at_offset(lines: list[str], offset: int) -> str:
+        current_section = ""
+        for line in lines[: min(offset + 1, len(lines))]:
+            if line.startswith("[") and "]" in line:
+                current_section = line.split("]", 1)[0].lstrip("[")
+        return current_section
 
     def _tab_lines(self, width: int) -> list[str]:
         lines: list[str] = []
