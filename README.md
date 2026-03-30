@@ -49,10 +49,13 @@ Main view:
 Keys:
 
 - `Up` / `Down`: move through the candidate list
+- `/`: open a search prompt that filters the candidate list by package name or description
+- `Esc`: clear the active main-view search filter
 - `Space`: mark or unmark the current package
 - `Enter`: inspect the selected package
 - `x`: remove all marked packages, or the current package when nothing is marked
 - `c`: clear all current marks
+- when a filter is active, `x` and `c` apply to the shown candidates only
 - `o`: open the orphan package view
 - `m`: protect and hide the selected package
 - `p`: open the user-protected package list
@@ -71,10 +74,12 @@ Orphan view:
 
 - lists dependency-installed packages with no reverse dependencies
 - auto-selects all visible orphan packages by default
+- `/` opens a search prompt that filters the orphan list by package name or description
+- `Esc` clears the active orphan-view search filter before it backs out of the view
 - `Space` toggles the current orphan on or off
-- `a` reselects all current orphans
-- `c` clears the current orphan selection
-- `x` runs a bulk uninstall for the currently selected orphan set
+- `a` reselects all shown orphans
+- `c` clears the shown orphan selection
+- `x` runs a bulk uninstall for the currently selected shown orphan set when a filter is active
 - `m` protects and hides the current orphan package
 
 Protected view:
@@ -125,7 +130,7 @@ monitor-tui --once --tab all
 The safe privilege model is:
 
 - run the TUI as your normal user
-- run `monitor-privileged-snapshot` as root on a timer
+- run `monitor-privileged-snapshot` as root once at boot and then on a timer
 - let the TUI read `/run/monitor/privileged_snapshot.json`
 
 Write a snapshot manually:
@@ -155,7 +160,7 @@ Debug a missing, stale, unreadable, or mismatched privileged snapshot:
 The debug script checks the snapshot file, systemd service/timer state, unit `ExecStart`,
 path mismatches, freshness, permissions, and recent service logs, then prints concrete fix steps.
 `monitor-privileged-snapshot.service` is a `Type=oneshot` unit, so `inactive (dead)` after a
-successful run is normal; the timer should be enabled and active.
+successful run is normal; the service should be enabled for boot, and the timer should be enabled and active.
 
 If you installed the helper into `/usr/local/bin`, you can also run:
 
