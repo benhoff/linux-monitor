@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,32 @@ from monitor.shared.text import line_list, read_text, shorten
 class BootCollector:
     def __init__(self, backend: object) -> None:
         self.backend = backend
+
+    @staticmethod
+    def permission_unavailable(text: str) -> bool:
+        lowered = text.lower()
+        return "failed to connect to system scope bus" in lowered or "operation not permitted" in lowered
+
+    @staticmethod
+    def blame_seconds(line: str) -> float | None:
+        match = re.match(r"([0-9]+(?:\.[0-9]+)?)(ms|s|min)\s+", line.strip())
+        if not match:
+            return None
+        value = float(match.group(1))
+        unit = match.group(2)
+        if unit == "ms":
+            return value / 1000.0
+        if unit == "min":
+            return value * 60.0
+        return value
+
+    def interesting_blame(self, rows: list[str]) -> list[str]:
+        interesting = []
+        for row in rows:
+            seconds = self.blame_seconds(row)
+            if seconds is None or seconds >= 1.0:
+                interesting.append(row)
+        return interesting[:6]
 
     def boot_time(self) -> str:
         result = run_command(["systemd-analyze"], timeout=4.0)
@@ -42,13 +69,19 @@ class BootCollector:
         return [self.uptime_summary()]
 
     def collect(self) -> list[str]:
-        lines = [
-            f"Boot time: {self.backend.cached('boot_time', 300.0, self.boot_time)}",
-            "Slowest boot services:",
-        ]
-        blame = self.backend.cached("boot_blame", 300.0, self.boot_blame)
-        for item in blame[:6]:
-            lines.append(f"  {item}")
-        if not blame:
-            lines.append("  unavailable")
+        boot_time = str(self.backend.cached("boot_time", 300.0, self.boot_time))
+        blame = self.interesting_blame(self.backend.cached("boot_blame", 300.0, self.boot_blame))
+        if self.permission_unavailable(boot_time) and not blame:
+            return [
+                self.uptime_summary(),
+                "Boot timing: unavailable without system bus access.",
+            ]
+
+        lines = [f"Boot time: {boot_time}"]
+        if blame:
+            lines.append("Slowest boot services:")
+            for item in blame:
+                lines.append(f"  {item}")
+        elif not self.permission_unavailable(boot_time):
+            lines.append("Slowest boot services: nothing above 1s.")
         return lines

@@ -25,11 +25,44 @@ from monitor.shared.text import line_list, parse_float, parse_int, read_lines, r
 
 
 BLUETOOTH_LOG_PATTERN = r"bluetooth|BlueZ|btusb|btintel|btmtk|hci\d+"
+INTERFACE_STATES = frozenset({"UP", "DOWN", "UNKNOWN", "DORMANT", "LOWERLAYERDOWN", "NOTPRESENT"})
 
 
 class NetworkCollector:
     def __init__(self, backend: object) -> None:
         self.backend = backend
+
+    @staticmethod
+    def _default_route_interface(route: str) -> str | None:
+        match = re.search(r"\bdev\s+(\S+)", route)
+        if not match:
+            return None
+        return match.group(1)
+
+    @staticmethod
+    def _parse_interface_line(line: str) -> tuple[str, str]:
+        parts = line.split()
+        if len(parts) < 2:
+            return "", ""
+        return parts[0], parts[1].upper()
+
+    def visible_interfaces(self, interfaces: Sequence[str], default_route: str) -> list[str]:
+        default_iface = self._default_route_interface(default_route)
+        visible: list[str] = []
+        fallback: list[str] = []
+        for raw in interfaces:
+            line = str(raw).strip()
+            if not line:
+                continue
+            name, state = self._parse_interface_line(line)
+            if not name or name == "lo":
+                continue
+            if state not in INTERFACE_STATES:
+                return [line]
+            fallback.append(line)
+            if name == default_iface or state != "DOWN":
+                visible.append(line)
+        return visible[:4] if visible else fallback[:2]
 
     def interface_summary(self) -> list[str]:
         result = run_command(["ip", "-brief", "address"], timeout=3.0)
@@ -99,15 +132,18 @@ class NetworkCollector:
             lines = []
             if snapshot_line:
                 lines.append(snapshot_line)
+            visible_interfaces = self.visible_interfaces(
+                [str(item) for item in interfaces] if isinstance(interfaces, list) else [],
+                default_route,
+            )
             lines.append("Interfaces:")
-            if isinstance(interfaces, list) and interfaces:
-                for item in interfaces[:6]:
+            if visible_interfaces:
+                for item in visible_interfaces:
                     lines.append(f"  {item}")
             else:
                 lines.append("  No interfaces available.")
             lines.append(f"Default route: {default_route}")
-            lines.append(f"DNS servers: {dns_servers}")
-            lines.append(f"DNS lookup: {self.backend.dns_probe_host} -> {dns_check}")
+            lines.append(f"DNS: {dns_servers} | {self.backend.dns_probe_host} -> {dns_check}")
             if established is None or listening is None:
                 lines.append("Connections: unavailable (socket inspection failed)")
             else:
@@ -119,13 +155,15 @@ class NetworkCollector:
         dns_servers = self.dns_servers()
         dns_check = self.backend.cached("dns_check", 60.0, self.dns_check)
         established, listening = self.socket_counts()
+        visible_interfaces = self.visible_interfaces(interfaces, default_route)
 
         lines = ["Interfaces:"]
-        for item in interfaces[:6]:
+        for item in visible_interfaces[:6]:
             lines.append(f"  {item}")
+        if not visible_interfaces:
+            lines.append("  No interfaces available.")
         lines.append(f"Default route: {default_route}")
-        lines.append(f"DNS servers: {dns_servers}")
-        lines.append(f"DNS lookup: {self.backend.dns_probe_host} -> {dns_check}")
+        lines.append(f"DNS: {dns_servers} | {self.backend.dns_probe_host} -> {dns_check}")
         if established is None or listening is None:
             lines.append("Connections: unavailable (socket inspection failed)")
         else:
@@ -565,7 +603,29 @@ class BluetoothCollector:
             "abort",
             "missing",
         )
-        return [entry for entry in entries if any(token in entry.lower() for token in issue_keywords)][:4]
+        issues: list[str] = []
+        for entry in entries:
+            lowered = entry.lower()
+            if "bluetoothctl" in lowered and "abort" in lowered:
+                continue
+            if "abort (libc.so.6" in lowered:
+                continue
+            if "_dbus_warn_check_failed" in lowered or "libdbus" in lowered:
+                continue
+            if any(token in lowered for token in issue_keywords):
+                issues.append(entry)
+        return issues[:4]
+
+    @staticmethod
+    def service_line(active: str, enabled: str) -> str:
+        active_value = active.strip() or "unknown"
+        enabled_value = enabled.strip() or "unknown"
+        combined = " ".join((active_value, enabled_value)).lower()
+        if "system bus unavailable" in combined:
+            return "Service: unavailable (system bus unavailable)"
+        if active_value == enabled_value:
+            return f"Service: {active_value}"
+        return f"Service: {active_value} | {enabled_value}"
 
     def live_state(self) -> dict[str, object]:
         service_active = self.unit_status("is-active", "bluetooth.service")
@@ -716,7 +776,7 @@ class BluetoothCollector:
         service_active = str(state.get("service_active", "unknown"))
         service_enabled = str(state.get("service_enabled", "unknown"))
 
-        lines: list[str] = [f"Service: {service_active} | {service_enabled}"]
+        lines: list[str] = [self.service_line(service_active, service_enabled)]
 
         if isinstance(adapters, list) and adapters:
             lines.append(f"Adapters: {len(adapters)} detected ({', '.join(adapters[:4])})")
@@ -765,33 +825,38 @@ class BluetoothCollector:
         connected_devices = [entry for entry in parsed_devices if entry.get("connected")]
         trusted_count = sum(1 for entry in parsed_devices if entry.get("trusted"))
         paired_count = sum(1 for entry in parsed_devices if entry.get("paired"))
-        lines.append("Devices: " + f"{paired_count} paired | {trusted_count} trusted | {len(connected_devices)} connected")
+        if paired_count or trusted_count or connected_devices:
+            lines.append("Devices: " + f"{paired_count} paired | {trusted_count} trusted | {len(connected_devices)} connected")
+        else:
+            lines.append("Devices: none paired or connected")
 
         if connected_devices:
             lines.append("Connected devices:")
             for entry in connected_devices[:4]:
                 lines.append(f"  {self.bluetooth_device_line(entry)}")
-        elif parsed_devices:
+        elif parsed_devices and (paired_count or trusted_count):
             lines.append("Known devices:")
             for entry in parsed_devices[:4]:
                 lines.append(f"  {self.bluetooth_device_line(entry)}")
-        else:
-            lines.append("Devices: no paired or connected devices reported.")
-
-        if isinstance(notes, list) and notes:
+        filtered_notes = []
+        for note in notes if isinstance(notes, list) else []:
+            note_text = str(note).strip()
+            if not note_text:
+                continue
+            if "failed to connect to d-bus" in note_text.lower() and "system bus unavailable" in lines[0].lower():
+                continue
+            if note_text not in filtered_notes:
+                filtered_notes.append(note_text)
+        if filtered_notes:
             lines.append("Collector notes:")
-            for note in notes[:3]:
+            for note in filtered_notes[:3]:
                 lines.append(f"  {note}")
 
-        lines.append("Recent Bluetooth logs:")
         issues = self.bluetooth_issue_logs(logs) if isinstance(logs, list) else []
         if issues:
+            lines.append("Recent Bluetooth logs:")
             for item in issues[:4]:
                 lines.append(f"  {item}")
-        elif isinstance(logs, list) and logs:
-            lines.append("  No obvious Bluetooth warnings in current boot journal.")
-        else:
-            lines.append("  No Bluetooth journal entries found this boot.")
         return lines
 
 
@@ -928,8 +993,40 @@ class WifiCollector:
             "auth",
             "blocked",
         )
-        issues = [entry for entry in entries if any(token in entry.lower() for token in issue_keywords)]
+        issues = []
+        for entry in entries:
+            lowered = entry.lower()
+            if "wireless extensions" in lowered:
+                continue
+            if "will stop working for wi-fi 7 hardware" in lowered:
+                continue
+            if any(token in lowered for token in issue_keywords):
+                issues.append(entry)
         return issues[:3]
+
+    @staticmethod
+    def rfkill_blocked(radios: Sequence[object]) -> bool:
+        for radio in radios:
+            if not isinstance(radio, dict):
+                continue
+            if radio.get("soft_blocked") or radio.get("hard_blocked"):
+                return True
+        return False
+
+    @staticmethod
+    def disconnected_assessment(entry: dict[str, object], blocked: bool) -> str:
+        operstate = str(entry.get("operstate", "unknown")).strip()
+        if blocked:
+            return f"Assessment: blocked by RFKill | operstate {operstate}"
+        return f"Assessment: disconnected | operstate {operstate}"
+
+    @staticmethod
+    def reliability_has_issue(text: str) -> bool:
+        lowered = text.lower()
+        return any(
+            token in lowered
+            for token in ("failed", "beacon loss", "driver retry discards", "missed beacon", "not authorized")
+        )
 
     def summary_line(self, entry: dict[str, object]) -> str:
         iface = str(entry.get("interface", "wifi"))
@@ -1166,23 +1263,23 @@ class WifiCollector:
             lines.append("No wireless interfaces detected.")
             return lines
 
+        blocked = self.rfkill_blocked(radios if isinstance(radios, list) else [])
         parsed_interfaces.sort(key=self.interface_sort_key)
         for entry in parsed_interfaces[:2]:
             lines.append(self.summary_line(entry))
-            lines.append("  " + self.link_line(entry))
-            lines.append("  " + self.signal_line(entry))
-            lines.append("  " + self.phy_line(entry))
-            lines.append("  " + self.traffic_line(entry))
-            lines.append("  " + self.reliability_line(entry))
-            lines.append("  " + self.assessment_line(entry))
+            if entry.get("connected"):
+                lines.append("  " + self.link_line(entry))
+                lines.append("  " + self.signal_line(entry))
+                reliability = self.reliability_line(entry)
+                if self.reliability_has_issue(reliability):
+                    lines.append("  " + reliability)
+                lines.append("  " + self.assessment_line(entry))
+            else:
+                lines.append("  " + self.disconnected_assessment(entry, blocked))
 
-        lines.append("Recent Wi-Fi logs:")
         issues = self.issue_logs(logs) if isinstance(logs, list) else []
         if issues:
+            lines.append("Recent Wi-Fi logs:")
             for item in issues[:3]:
                 lines.append(f"  {item}")
-        elif isinstance(logs, list) and logs:
-            lines.append("  No obvious Wi-Fi warnings in current boot journal.")
-        else:
-            lines.append("  No Wi-Fi journal entries found this boot.")
         return lines

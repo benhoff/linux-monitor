@@ -41,11 +41,42 @@ VM_IMAGE_DIRS = (
     Path.home() / "VirtualBox VMs",
 )
 VM_IMAGE_SUFFIXES = (".qcow2", ".img", ".vdi", ".vmdk", ".vhd", ".vhdx")
+PACKAGE_CACHE_NOTICE_BYTES = 5 * 1024**3
+PACKAGE_CACHE_NOTICE_AGE = 30 * 86400
+LOG_DIR_NOTICE_BYTES = 2 * 1024**3
+TEMP_NOTICE_BYTES = 512 * 1024**2
+VM_IMAGE_NOTICE_BYTES = 10 * 1024**3
 
 
 class HygieneCollector:
     def __init__(self, backend: object) -> None:
         self.backend = backend
+
+    @staticmethod
+    def _is_permission_note(note: str) -> bool:
+        lowered = note.lower()
+        return "failed to connect to system scope bus" in lowered or "operation not permitted" in lowered
+
+    @staticmethod
+    def _embedded_size_bytes(text: str) -> int | None:
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgtpe]?)(?:i?b)?\b", text.strip(), re.IGNORECASE)
+        if not match:
+            return None
+        amount = float(match.group(1))
+        unit = match.group(2).upper()
+        factors = {
+            "": 1,
+            "K": 1024,
+            "M": 1024**2,
+            "G": 1024**3,
+            "T": 1024**4,
+            "P": 1024**5,
+            "E": 1024**6,
+        }
+        factor = factors.get(unit)
+        if factor is None:
+            return None
+        return int(amount * factor)
 
     def path_size(self, path: Path, timeout: float = 6.0) -> int | None:
         if not path.exists():
@@ -236,6 +267,16 @@ class HygieneCollector:
         return {
             "summary": "Container / VM leftovers: " + (" | ".join(summary_parts) if summary_parts else "none obvious"),
             "details": details,
+            "docker_data_bytes": docker_data,
+            "docker_exited": docker_exited,
+            "docker_dangling_images": docker_dangling_images,
+            "docker_dangling_volumes": docker_dangling_volumes,
+            "podman_root_bytes": podman_root,
+            "podman_user_bytes": podman_user,
+            "podman_exited": podman_exited,
+            "podman_dangling_images": podman_dangling_images,
+            "vm_count": len(vm_images),
+            "vm_total_bytes": sum(size for _path, size in vm_images),
         }
 
     def journal_disk_usage(self) -> str:
@@ -260,50 +301,57 @@ class HygieneCollector:
         var_tmp_dir = self.backend.cached("var_tmp_dir_size", 300.0, lambda: self.path_size(Path("/var/tmp")))
         journal_usage = self.backend.cached("journal_disk_usage", 300.0, self.journal_disk_usage)
 
-        lines = [f"Orphans: {len(orphaned)}" + (f" ({orphan_error})" if orphan_error else "")]
+        lines: list[str] = []
+        if orphan_error:
+            lines.append(f"Orphans: unavailable ({orphan_error})")
         if orphaned:
+            lines.append(f"Orphans: {len(orphaned)}")
             lines.append(f"  {', '.join(orphaned[:10])}")
         if isinstance(package_cache, dict):
             cache_size = package_cache.get("size")
             cache_files = int(package_cache.get("files", 0))
             oldest_age = package_cache.get("oldest_age")
-            cache_line = str(package_cache.get("label", self.backend.package_cache_label)) + ": " + (
-                format_bytes(cache_size) if isinstance(cache_size, int) and cache_size >= 0 else "unavailable"
-            )
-            if cache_files > 0:
-                cache_line += f" across {cache_files} file(s)"
-            if isinstance(oldest_age, int) and oldest_age > 0:
-                cache_line += f" | oldest {self.backend._age_label(oldest_age)}"
-            lines.append(cache_line)
+            cache_is_large = isinstance(cache_size, int) and cache_size >= PACKAGE_CACHE_NOTICE_BYTES
+            cache_is_stale = isinstance(oldest_age, int) and oldest_age >= PACKAGE_CACHE_NOTICE_AGE
+            if cache_is_large or cache_is_stale:
+                cache_line = str(package_cache.get("label", self.backend.package_cache_label)) + ": " + (
+                    format_bytes(cache_size) if isinstance(cache_size, int) and cache_size >= 0 else "unavailable"
+                )
+                if cache_files > 0:
+                    cache_line += f" across {cache_files} file(s)"
+                if isinstance(oldest_age, int) and oldest_age > 0:
+                    cache_line += f" | oldest {self.backend._age_label(oldest_age)}"
+                lines.append(cache_line)
         else:
             lines.append(self.backend.package_cache_label + ": unavailable")
-        lines.append("Log directory: " + (format_bytes(log_dir) if isinstance(log_dir, int) and log_dir >= 0 else "unavailable"))
-        lines.append("Journal storage: " + str(journal_usage))
-        lines.append(
-            "Temp usage: "
-            + ", ".join(
-                filter(
-                    None,
-                    [
-                        f"/tmp {format_bytes(tmp_dir)}" if isinstance(tmp_dir, int) and tmp_dir >= 0 else "",
-                        f"/var/tmp {format_bytes(var_tmp_dir)}" if isinstance(var_tmp_dir, int) and var_tmp_dir >= 0 else "",
-                    ],
-                )
-            )
-        )
-        if lines[-1] == "Temp usage: ":
-            lines[-1] = "Temp usage: unavailable"
-        noisy_dirs = [(path, size) for path, size in dir_sizes if size >= 512 * 1024**2]
-        if noisy_dirs:
-            lines.append(
-                "Large directories: " + ", ".join(f"{self.backend._abbreviate_path(path)} {format_bytes(size)}" for path, size in noisy_dirs[:4])
-            )
-        else:
-            lines.append("Large directories: none above 512 MiB in watched paths.")
+
+        journal_size = self._embedded_size_bytes(str(journal_usage))
+        if (
+            isinstance(log_dir, int)
+            and log_dir >= LOG_DIR_NOTICE_BYTES
+        ) or (
+            isinstance(journal_size, int)
+            and journal_size >= LOG_DIR_NOTICE_BYTES
+        ):
+            parts = []
+            if isinstance(log_dir, int) and log_dir >= 0:
+                parts.append(f"/var/log {format_bytes(log_dir)}")
+            if str(journal_usage).strip() and "unavailable" not in str(journal_usage).lower():
+                parts.append(f"journal {journal_usage}")
+            if parts:
+                lines.append("Logs: " + " | ".join(parts))
+
+        temp_parts = []
+        if isinstance(tmp_dir, int) and tmp_dir >= TEMP_NOTICE_BYTES:
+            temp_parts.append(f"/tmp {format_bytes(tmp_dir)}")
+        if isinstance(var_tmp_dir, int) and var_tmp_dir >= TEMP_NOTICE_BYTES:
+            temp_parts.append(f"/var/tmp {format_bytes(var_tmp_dir)}")
+        if temp_parts:
+            lines.append("Temp usage: " + ", ".join(temp_parts))
 
         if config_error:
             lines.append(f"Config drift: unavailable ({config_error})")
-        else:
+        elif config_drift:
             lines.append(f"Config drift: {len(config_drift)} tracked leftover file(s) under /etc")
             for item in config_drift[:4]:
                 lines.append(f"  {item}")
@@ -314,7 +362,7 @@ class HygieneCollector:
             failed_timers = timer_hygiene.get("failed_timers", [])
             no_next_run = timer_hygiene.get("no_next_run", [])
             cron_count = int(timer_hygiene.get("cron_count", 0))
-            timer_notes = ", ".join(
+            raw_timer_notes = [
                 note
                 for note in (
                     timer_hygiene.get("enabled_error"),
@@ -322,23 +370,42 @@ class HygieneCollector:
                     timer_hygiene.get("timers_error"),
                 )
                 if isinstance(note, str) and note
-            )
-            lines.append(
-                f"Scheduled tasks: {enabled_display} enabled timer(s) | "
-                f"{len(failed_timers) if isinstance(failed_timers, list) else 0} failed | "
-                f"{cron_count} cron entry/file(s)"
-                + (f" ({timer_notes})" if timer_notes else "")
-            )
+            ]
+            timer_notes = [note for note in raw_timer_notes if not self._is_permission_note(note)]
+            failed_count = len(failed_timers) if isinstance(failed_timers, list) else 0
+            no_next_count = len(no_next_run) if isinstance(no_next_run, list) else 0
+            if failed_count or no_next_count or timer_notes:
+                lines.append(
+                    f"Scheduled tasks: {enabled_display} enabled timer(s) | "
+                    f"{failed_count} failed | {cron_count} cron entry/file(s)"
+                    + (f" ({', '.join(timer_notes)})" if timer_notes else "")
+                )
             if isinstance(failed_timers, list) and failed_timers:
                 lines.append(f"  Failed timers: {summarize_list(failed_timers, limit=3)}")
             if isinstance(no_next_run, list) and no_next_run:
                 lines.append(f"  No next run: {summarize_list(no_next_run, limit=3)}")
 
         if isinstance(container_vm, dict):
-            summary = str(container_vm.get("summary", "Container / VM leftovers: none obvious"))
-            lines.append(summary)
-            details = container_vm.get("details", [])
-            if isinstance(details, list):
-                for item in details[:2]:
-                    lines.append(f"  {shorten(str(item), 140)}")
+            has_container_cleanup_issue = any(
+                isinstance(container_vm.get(key), int) and int(container_vm.get(key) or 0) > 0
+                for key in (
+                    "docker_exited",
+                    "docker_dangling_images",
+                    "docker_dangling_volumes",
+                    "podman_exited",
+                    "podman_dangling_images",
+                )
+            )
+            vm_total_bytes = container_vm.get("vm_total_bytes")
+            show_vm_inventory = isinstance(vm_total_bytes, int) and vm_total_bytes >= VM_IMAGE_NOTICE_BYTES
+            if has_container_cleanup_issue or show_vm_inventory:
+                summary = str(container_vm.get("summary", "Container / VM leftovers: none obvious"))
+                lines.append(summary)
+                details = container_vm.get("details", [])
+                if isinstance(details, list):
+                    for item in details[:2]:
+                        lines.append(f"  {shorten(str(item), 140)}")
+
+        if not lines:
+            return ["No notable cleanup pressure."]
         return lines

@@ -698,10 +698,16 @@ class ContainersCollector:
         if not state.get("available"):
             storage_line = self.storage_line(state)
             if storage_line:
-                lines.append(storage_line)
+                lines[0] += " | " + storage_line.removeprefix("Storage: ")
             notes = state.get("notes", [])
             if isinstance(notes, list) and notes:
-                lines.append("Notes: " + summarize_list([shorten(str(item), 80) for item in notes], limit=2))
+                filtered_notes = [
+                    shorten(str(item), 80)
+                    for item in notes
+                    if str(item).strip() and str(item).strip() not in access_parts
+                ]
+                if filtered_notes:
+                    lines.append("Notes: " + summarize_list(filtered_notes, limit=2))
             return lines
 
         lines.append(self.runtime_line(state))
