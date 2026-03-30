@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 
 from monitor.shared.constants import PRIVILEGED_SNAPSHOT_VERSION
-from monitor.shared.formatting import format_bytes
 from monitor.shared.parsing_journal import summarize_journal_entries
 from monitor.shared.paths import diff_snapshot_state_path, legacy_repo_diff_snapshot_path
 
@@ -56,6 +55,190 @@ class DiffSnapshotService:
 
     def current_state_digest(self) -> dict[str, object]:
         return self.backend.cached("current_state_digest", 10.0, self.build_state_digest)
+
+    @staticmethod
+    def state_rank(state: str) -> int:
+        return {
+            "unknown": 0,
+            "ok": 1,
+            "watch": 2,
+            "critical": 3,
+        }.get(state, 0)
+
+    @staticmethod
+    def alert_prefix(severity: int) -> str:
+        return "!" if severity >= 80 else "?"
+
+    def transition_line(
+        self,
+        domain: str,
+        previous_state: str,
+        current_state: str,
+        current_summary: str,
+        severity: int,
+    ) -> tuple[int, str] | None:
+        previous_rank = self.state_rank(previous_state)
+        current_rank = self.state_rank(current_state)
+        if current_rank > previous_rank:
+            return severity, f"{self.alert_prefix(severity)} {domain} regressed: {current_summary}"
+        if current_rank < previous_rank:
+            return 5, f"Resolved: {domain} {current_summary}"
+        return None
+
+    def storage_state(self, payload: object) -> tuple[str, int, str]:
+        if not isinstance(payload, dict):
+            return "unknown", 0, "state unavailable"
+        root_pct = payload.get("root_pct")
+        critical_count = payload.get("critical_count")
+        watch_count = payload.get("watch_count")
+        if isinstance(root_pct, int) and root_pct >= 90:
+            return "critical", 95, f"root is {root_pct}% full"
+        if isinstance(critical_count, int) and critical_count > 0:
+            return "critical", 95, f"{critical_count} filesystem(s) are in critical capacity"
+        if isinstance(root_pct, int) and root_pct >= 75:
+            return "watch", 70, f"root is {root_pct}% full"
+        if isinstance(watch_count, int) and watch_count > 0:
+            return "watch", 60, f"{watch_count} filesystem(s) are approaching capacity"
+        return "ok", 0, "returned to healthy capacity"
+
+    def systemd_state(self, payload: object) -> tuple[str, int, str]:
+        if not isinstance(payload, dict):
+            return "unknown", 0, "state unavailable"
+        failed_services = payload.get("failed_services")
+        state_value = str(payload.get("state", "unknown"))
+        if isinstance(failed_services, int) and failed_services > 0:
+            severity = 100 if failed_services >= 3 else 80
+            return "critical", severity, f"{failed_services} failed service(s) ({state_value})"
+        if state_value in {"degraded", "failed"}:
+            return "watch", 75, f"state is {state_value}"
+        return "ok", 0, "returned to running"
+
+    def privileged_snapshot_state(self, payload: object) -> tuple[str, int, str]:
+        if not isinstance(payload, dict):
+            return "unknown", 0, "state unavailable"
+        status = str(payload.get("status", "missing"))
+        version = payload.get("version")
+        expected = int(payload.get("expected_version", PRIVILEGED_SNAPSHOT_VERSION))
+        age = payload.get("age")
+        version_label = f"v{version}" if isinstance(version, int) else "missing schema"
+        if status == "healthy":
+            return "ok", 0, "is healthy again"
+        if status == "stale":
+            age_label = self.backend._age_label(age) if isinstance(age, int) else "unknown age"
+            return "watch", 65, f"is stale ({version_label}, {age_label} old)"
+        if status == "version_drift":
+            return "critical", 95, f"has schema drift ({version_label}, need v{expected})"
+        if status == "unreadable":
+            return "critical", 90, "is unreadable"
+        if status == "invalid":
+            return "critical", 90, "is invalid"
+        return "watch", 70, "is missing"
+
+    def docker_state(self, payload: object) -> tuple[str, int, str]:
+        if not isinstance(payload, dict):
+            return "unknown", 0, "state unavailable"
+        if not payload.get("detected"):
+            return "ok", 0, "has no detected runtime issues"
+        unhealthy = int(payload.get("unhealthy", 0) or 0)
+        restarting = int(payload.get("restarting", 0) or 0)
+        dead = int(payload.get("dead", 0) or 0)
+        if unhealthy or restarting or dead:
+            parts = []
+            if unhealthy:
+                parts.append(f"{unhealthy} unhealthy")
+            if restarting:
+                parts.append(f"{restarting} restarting")
+            if dead:
+                parts.append(f"{dead} dead")
+            return "critical", 90, "reports " + " | ".join(parts) + " container(s)"
+        available = bool(payload.get("available"))
+        service_state = str(payload.get("docker_service", "")).strip()
+        if not available and service_state == "active":
+            return "watch", 70, "daemon is no longer reachable"
+        return "ok", 0, "is healthy again"
+
+    def capture_state(self, payload: object) -> tuple[str, int, str]:
+        if not isinstance(payload, dict):
+            return "unknown", 0, "state unavailable"
+        cards = int(payload.get("avmatrix_cards", 0) or 0)
+        kernel = int(payload.get("kernel_channels", 0) or 0)
+        nodes = int(payload.get("video_nodes", 0) or 0)
+        if cards <= 0:
+            return "ok", 0, "has no AVMatrix regression"
+        if kernel == 0:
+            return "critical", 95, "card is present but kernel channels are missing"
+        if nodes == 0:
+            return "critical", 100, f"has {kernel} kernel channel(s) but no /dev/video nodes"
+        if nodes < kernel:
+            return "watch", 80, f"exposes only {nodes}/{kernel} /dev/video nodes"
+        return "ok", 0, "device nodes are healthy again"
+
+    def compare_storage(self, current: object, previous: object) -> tuple[int, str] | None:
+        current_state, severity, summary = self.storage_state(current)
+        previous_state, _previous_severity, _previous_summary = self.storage_state(previous)
+        return self.transition_line("Storage", previous_state, current_state, summary, severity)
+
+    def compare_systemd(self, current: object, previous: object) -> tuple[int, str] | None:
+        current_state, severity, summary = self.systemd_state(current)
+        previous_state, _previous_severity, _previous_summary = self.systemd_state(previous)
+        return self.transition_line("Systemd", previous_state, current_state, summary, severity)
+
+    def compare_privileged_snapshot(self, current: object, previous: object) -> tuple[int, str] | None:
+        current_state, severity, summary = self.privileged_snapshot_state(current)
+        previous_state, _previous_severity, _previous_summary = self.privileged_snapshot_state(previous)
+        return self.transition_line("Privileged snapshot", previous_state, current_state, summary, severity)
+
+    def compare_docker(self, current: object, previous: object) -> tuple[int, str] | None:
+        current_state, severity, summary = self.docker_state(current)
+        previous_state, _previous_severity, _previous_summary = self.docker_state(previous)
+        return self.transition_line("Docker", previous_state, current_state, summary, severity)
+
+    def compare_capture(self, current: object, previous: object) -> tuple[int, str] | None:
+        current_state, severity, summary = self.capture_state(current)
+        previous_state, _previous_severity, _previous_summary = self.capture_state(previous)
+        return self.transition_line("AVMatrix", previous_state, current_state, summary, severity)
+
+    def compare_ethernet(self, current: object, previous: object) -> tuple[int, str] | None:
+        if not isinstance(current, dict) or not isinstance(previous, dict):
+            return None
+        current_iface = str(current.get("interface", "")).strip()
+        previous_iface = str(previous.get("interface", "")).strip()
+        current_default = bool(current.get("default_route"))
+        previous_default = bool(previous.get("default_route"))
+        current_connected = bool(current.get("connected"))
+        previous_connected = bool(previous.get("connected"))
+        iface_label = current_iface or previous_iface or "ethernet"
+        if not (current_default or previous_default):
+            return None
+        if current_connected == previous_connected:
+            return None
+        if current_connected:
+            return 5, f"Resolved: Ethernet link restored on {iface_label}"
+        return 85, f"! Ethernet regressed: default-route link went down on {iface_label}"
+
+    def compare_wifi(self, current: object, previous: object, ethernet_current: object) -> tuple[int, str] | None:
+        if not isinstance(current, dict) or not isinstance(previous, dict):
+            return None
+        ethernet_default_route_up = (
+            isinstance(ethernet_current, dict)
+            and bool(ethernet_current.get("default_route"))
+            and bool(ethernet_current.get("connected"))
+        )
+        current_blocked = bool(current.get("blocked"))
+        previous_blocked = bool(previous.get("blocked"))
+        if current_blocked != previous_blocked:
+            if current_blocked:
+                return 85, "! Wi-Fi regressed: radio became rfkill-blocked"
+            return 5, "Resolved: Wi-Fi radio unblocked"
+
+        current_connected = bool(current.get("connected"))
+        previous_connected = bool(previous.get("connected"))
+        if current_connected == previous_connected or ethernet_default_route_up:
+            return None
+        if current_connected:
+            ssid = str(current.get("ssid", "")).strip()
+            return 5, f"Resolved: Wi-Fi connected to {ssid or 'network'}"
+        return 75, "! Wi-Fi regressed: link dropped"
 
     def build_state_digest(self) -> dict[str, object]:
         now = time.time()
@@ -224,323 +407,32 @@ class DiffSnapshotService:
         else:
             lines.append("Compared with previous snapshot")
 
-        changes: list[str] = []
-        current_packages = current.get("packages", {})
-        previous_packages = previous.get("packages", {})
-        if isinstance(current_packages, dict) and isinstance(previous_packages, dict):
-            current_total = None
-            previous_total = None
-            if isinstance(current_packages.get("repo_pending"), int) and isinstance(
-                current_packages.get("aur_pending"),
-                int,
-            ):
-                current_total = int(current_packages["repo_pending"]) + int(current_packages["aur_pending"])
-            if isinstance(previous_packages.get("repo_pending"), int) and isinstance(
-                previous_packages.get("aur_pending"),
-                int,
-            ):
-                previous_total = int(previous_packages["repo_pending"]) + int(previous_packages["aur_pending"])
-            if current_total is not None and previous_total is not None and current_total != previous_total:
-                delta = current_total - previous_total
-                changes.append(f"Packages: {delta:+d} pending updates ({current_total} now)")
-            current_tracked = current_packages.get("tracked_outdated")
-            previous_tracked = previous_packages.get("tracked_outdated")
-            if (
-                isinstance(current_tracked, int)
-                and isinstance(previous_tracked, int)
-                and current_tracked != previous_tracked
-            ):
-                delta = current_tracked - previous_tracked
-                changes.append(f"Tracked priority packages: {delta:+d} outdated ({current_tracked} now)")
-
-        current_storage = current.get("storage", {})
-        previous_storage = previous.get("storage", {})
-        if isinstance(current_storage, dict) and isinstance(previous_storage, dict):
-            current_root_pct = current_storage.get("root_pct")
-            previous_root_pct = previous_storage.get("root_pct")
-            if (
-                isinstance(current_root_pct, int)
-                and isinstance(previous_root_pct, int)
-                and current_root_pct != previous_root_pct
-            ):
-                changes.append(f"Root usage: {current_root_pct - previous_root_pct:+d}% ({current_root_pct}% now)")
-            current_root_free = current_storage.get("root_free")
-            previous_root_free = previous_storage.get("root_free")
-            if isinstance(current_root_free, int) and isinstance(previous_root_free, int):
-                delta = current_root_free - previous_root_free
-                if abs(delta) >= 1024**3:
-                    changes.append(
-                        f"Root free space: {format_bytes(delta)} change ({format_bytes(current_root_free)} now)"
-                    )
-            current_growth = current_storage.get("growth", {})
-            previous_growth = previous_storage.get("growth", {})
-            if isinstance(current_growth, dict) and isinstance(previous_growth, dict):
-                growth_deltas = []
-                for path, size in current_growth.items():
-                    previous_size = previous_growth.get(path)
-                    if isinstance(size, int) and isinstance(previous_size, int):
-                        delta = size - previous_size
-                        if abs(delta) >= 1024**3:
-                            growth_deltas.append((path, delta))
-                growth_deltas.sort(key=lambda item: abs(item[1]), reverse=True)
-                if growth_deltas:
-                    changes.append(
-                        "Growth: "
-                        + ", ".join(
-                            f"{path} {format_bytes(delta)}"
-                            for path, delta in growth_deltas[:2]
-                        )
-                    )
-
-        current_systemd = current.get("systemd", {})
-        previous_systemd = previous.get("systemd", {})
-        if isinstance(current_systemd, dict) and isinstance(previous_systemd, dict):
-            current_failed = current_systemd.get("failed_services")
-            previous_failed = previous_systemd.get("failed_services")
-            if (
-                isinstance(current_failed, int)
-                and isinstance(previous_failed, int)
-                and current_failed != previous_failed
-            ):
-                changes.append(f"Failed services: {current_failed - previous_failed:+d} ({current_failed} now)")
-
-        current_snapshot = current.get("privileged_snapshot", {})
-        previous_snapshot = previous.get("privileged_snapshot", {})
-        if isinstance(current_snapshot, dict) and isinstance(previous_snapshot, dict):
-            current_status = str(current_snapshot.get("status", "missing"))
-            previous_status = str(previous_snapshot.get("status", "missing"))
-            if current_status != previous_status:
-                changes.append(f"Privileged snapshot: {previous_status} -> {current_status}")
-            current_version = current_snapshot.get("version")
-            previous_version = previous_snapshot.get("version")
-            if (
-                isinstance(current_version, int)
-                and isinstance(previous_version, int)
-                and current_version != previous_version
-            ):
-                changes.append(f"Privileged snapshot schema: v{previous_version} -> v{current_version}")
-
-        current_containers = current.get("containers", {})
-        previous_containers = previous.get("containers", {})
-        if isinstance(current_containers, dict) and isinstance(previous_containers, dict):
-            current_unhealthy = current_containers.get("unhealthy")
-            previous_unhealthy = previous_containers.get("unhealthy")
-            if (
-                isinstance(current_unhealthy, int)
-                and isinstance(previous_unhealthy, int)
-                and current_unhealthy != previous_unhealthy
-            ):
-                changes.append(
-                    f"Docker unhealthy: {current_unhealthy - previous_unhealthy:+d} ({current_unhealthy} now)"
-                )
-            current_restarting = current_containers.get("restarting")
-            previous_restarting = previous_containers.get("restarting")
-            if (
-                isinstance(current_restarting, int)
-                and isinstance(previous_restarting, int)
-                and current_restarting != previous_restarting
-            ):
-                changes.append(
-                    f"Docker restarting: {current_restarting - previous_restarting:+d} ({current_restarting} now)"
-                )
-            current_dead = current_containers.get("dead")
-            previous_dead = previous_containers.get("dead")
-            if (
-                isinstance(current_dead, int)
-                and isinstance(previous_dead, int)
-                and current_dead != previous_dead
-            ):
-                changes.append(f"Docker dead: {current_dead - previous_dead:+d} ({current_dead} now)")
-            current_data = current_containers.get("docker_data_bytes")
-            previous_data = previous_containers.get("docker_data_bytes")
-            if isinstance(current_data, int) and isinstance(previous_data, int):
-                delta = current_data - previous_data
-                if abs(delta) >= 1024**3:
-                    changes.append(
-                        f"Docker data: {format_bytes(delta)} change ({format_bytes(current_data)} now)"
-                    )
-            current_reclaimable = current_containers.get("reclaimable_bytes")
-            previous_reclaimable = previous_containers.get("reclaimable_bytes")
-            if isinstance(current_reclaimable, int) and isinstance(previous_reclaimable, int):
-                delta = current_reclaimable - previous_reclaimable
-                if abs(delta) >= 1024**3:
-                    changes.append(
-                        f"Docker reclaimable: {format_bytes(delta)} change ({format_bytes(current_reclaimable)} now)"
-                    )
-            current_stale = current_containers.get("stale_images_90d")
-            previous_stale = previous_containers.get("stale_images_90d")
-            if (
-                isinstance(current_stale, int)
-                and isinstance(previous_stale, int)
-                and current_stale != previous_stale
-            ):
-                changes.append(
-                    f"Docker stale images (>90d): {current_stale - previous_stale:+d} ({current_stale} now)"
-                )
-
-        current_wifi = current.get("wifi", {})
-        previous_wifi = previous.get("wifi", {})
-        current_ethernet = current.get("ethernet", {})
-        previous_ethernet = previous.get("ethernet", {})
-        if isinstance(current_ethernet, dict) and isinstance(previous_ethernet, dict):
-            current_present = bool(current_ethernet.get("present"))
-            previous_present = bool(previous_ethernet.get("present"))
-            current_iface = str(current_ethernet.get("interface", "")).strip()
-            previous_iface = str(previous_ethernet.get("interface", "")).strip()
-            current_connected = bool(current_ethernet.get("connected"))
-            previous_connected = bool(previous_ethernet.get("connected"))
-            iface_label = current_iface or previous_iface or "ethernet"
-
-            if (
-                current_present
-                and previous_present
-                and current_iface
-                and previous_iface
-                and current_iface != previous_iface
-            ):
-                changes.append(f"Ethernet interface: {previous_iface} -> {current_iface}")
-            if (current_present or previous_present) and current_connected != previous_connected:
-                changes.append(
-                    f"Ethernet: link up on {iface_label}"
-                    if current_connected
-                    else f"Ethernet: link down on {iface_label}"
-                )
-
-            current_speed = current_ethernet.get("speed_mbps")
-            previous_speed = previous_ethernet.get("speed_mbps")
-            if (
-                current_connected
-                and previous_connected
-                and isinstance(current_speed, int)
-                and isinstance(previous_speed, int)
-                and current_speed != previous_speed
-            ):
-                changes.append(f"Ethernet speed: {previous_speed} -> {current_speed} Mb/s")
-
-            current_error_count = current_ethernet.get("error_count")
-            previous_error_count = previous_ethernet.get("error_count")
-            if (
-                isinstance(current_error_count, int)
-                and isinstance(previous_error_count, int)
-                and current_error_count > previous_error_count
-            ):
-                delta = current_error_count - previous_error_count
-                changes.append(f"Ethernet errors: +{delta} ({current_error_count} total)")
-
-            current_drop_count = current_ethernet.get("drop_count")
-            previous_drop_count = previous_ethernet.get("drop_count")
-            if (
-                isinstance(current_drop_count, int)
-                and isinstance(previous_drop_count, int)
-                and current_drop_count - previous_drop_count >= 25
-            ):
-                delta = current_drop_count - previous_drop_count
-                changes.append(f"Ethernet drops: +{delta} ({current_drop_count} total)")
-
-            current_link_down_count = current_ethernet.get("link_down_count")
-            previous_link_down_count = previous_ethernet.get("link_down_count")
-            if (
-                isinstance(current_link_down_count, int)
-                and isinstance(previous_link_down_count, int)
-                and current_link_down_count - previous_link_down_count >= 3
-            ):
-                delta = current_link_down_count - previous_link_down_count
-                changes.append(f"Ethernet link drops: +{delta} ({current_link_down_count} total)")
-
-        if isinstance(current_wifi, dict) and isinstance(previous_wifi, dict):
-            current_connected = bool(current_wifi.get("connected"))
-            previous_connected = bool(previous_wifi.get("connected"))
-            if current_connected != previous_connected:
-                if current_connected:
-                    ssid = str(current_wifi.get("ssid", "")).strip()
-                    changes.append(f"Wi-Fi: connected to {ssid or 'network'}")
-                else:
-                    changes.append("Wi-Fi: link dropped")
-            current_ssid = str(current_wifi.get("ssid", "")).strip()
-            previous_ssid = str(previous_wifi.get("ssid", "")).strip()
-            if (
-                current_connected
-                and previous_connected
-                and current_ssid
-                and previous_ssid
-                and current_ssid != previous_ssid
-            ):
-                changes.append(f"Wi-Fi SSID: {previous_ssid} -> {current_ssid}")
-            current_signal = current_wifi.get("signal_dbm")
-            previous_signal = previous_wifi.get("signal_dbm")
-            if (
-                isinstance(current_signal, (int, float))
-                and isinstance(previous_signal, (int, float))
-                and abs(float(current_signal) - float(previous_signal)) >= 10.0
-            ):
-                changes.append(f"Wi-Fi signal: {previous_signal:.0f} -> {current_signal:.0f} dBm")
-            current_blocked = bool(current_wifi.get("blocked"))
-            previous_blocked = bool(previous_wifi.get("blocked"))
-            if current_blocked != previous_blocked:
-                changes.append("Wi-Fi radio: blocked" if current_blocked else "Wi-Fi radio: unblocked")
-
-        current_bluetooth = current.get("bluetooth", {})
-        previous_bluetooth = previous.get("bluetooth", {})
-        if isinstance(current_bluetooth, dict) and isinstance(previous_bluetooth, dict):
-            current_connected = current_bluetooth.get("connected_count")
-            previous_connected = previous_bluetooth.get("connected_count")
-            if (
-                isinstance(current_connected, int)
-                and isinstance(previous_connected, int)
-                and current_connected != previous_connected
-            ):
-                changes.append(
-                    f"Bluetooth: {current_connected - previous_connected:+d} connected devices ({current_connected} now)"
-                )
-            current_blocked = bool(current_bluetooth.get("blocked"))
-            previous_blocked = bool(previous_bluetooth.get("blocked"))
-            if current_blocked != previous_blocked:
-                changes.append("Bluetooth radio: blocked" if current_blocked else "Bluetooth radio: unblocked")
-            current_powered = current_bluetooth.get("powered")
-            previous_powered = previous_bluetooth.get("powered")
-            if (
-                isinstance(current_powered, bool)
-                and isinstance(previous_powered, bool)
-                and current_powered != previous_powered
-            ):
-                changes.append(
-                    "Bluetooth controller: powered on"
-                    if current_powered
-                    else "Bluetooth controller: powered off"
-                )
-
-        current_capture = current.get("capture", {})
-        previous_capture = previous.get("capture", {})
-        if isinstance(current_capture, dict) and isinstance(previous_capture, dict):
-            current_cards = current_capture.get("avmatrix_cards")
-            previous_cards = previous_capture.get("avmatrix_cards")
-            current_kernel = current_capture.get("kernel_channels")
-            previous_kernel = previous_capture.get("kernel_channels")
-            current_nodes = current_capture.get("video_nodes")
-            previous_nodes = previous_capture.get("video_nodes")
-            if (
-                isinstance(current_cards, int)
-                and isinstance(previous_cards, int)
-                and current_cards != previous_cards
-            ):
-                changes.append(f"AVMatrix cards: {current_cards - previous_cards:+d} detected ({current_cards} now)")
-            if (
-                isinstance(current_kernel, int)
-                and isinstance(previous_kernel, int)
-                and isinstance(current_nodes, int)
-                and isinstance(previous_nodes, int)
-                and (current_kernel != previous_kernel or current_nodes != previous_nodes)
-            ):
-                changes.append(
-                    "AVMatrix nodes: "
-                    + f"{current_nodes}/{current_kernel} /dev-to-kernel channels "
-                    + f"(was {previous_nodes}/{previous_kernel})"
-                )
+        changes: list[tuple[int, str]] = []
+        comparators = (
+            self.compare_storage(current.get("storage", {}), previous.get("storage", {})),
+            self.compare_systemd(current.get("systemd", {}), previous.get("systemd", {})),
+            self.compare_privileged_snapshot(
+                current.get("privileged_snapshot", {}),
+                previous.get("privileged_snapshot", {}),
+            ),
+            self.compare_docker(current.get("containers", {}), previous.get("containers", {})),
+            self.compare_ethernet(current.get("ethernet", {}), previous.get("ethernet", {})),
+            self.compare_wifi(
+                current.get("wifi", {}),
+                previous.get("wifi", {}),
+                current.get("ethernet", {}),
+            ),
+            self.compare_capture(current.get("capture", {}), previous.get("capture", {})),
+        )
+        for item in comparators:
+            if item is not None:
+                changes.append(item)
 
         if not changes:
             lines.append("No high-signal changes since the last diff snapshot.")
         else:
-            lines.extend(changes[:5])
+            for _severity, message in sorted(changes, key=lambda item: item[0], reverse=True)[:5]:
+                lines.append(message)
 
         if (
             not isinstance(captured_at, (int, float))

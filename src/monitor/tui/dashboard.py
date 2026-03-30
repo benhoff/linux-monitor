@@ -214,6 +214,8 @@ class DashboardUI:
             return True
         if stripped == "No high-signal changes since the last diff snapshot.":
             return True
+        if stripped.startswith("Resolved:"):
+            return True
         if stripped == "Updates: none":
             return True
         if stripped.startswith("Uptime:"):

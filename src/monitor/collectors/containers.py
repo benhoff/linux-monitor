@@ -506,23 +506,26 @@ class ContainersCollector:
     def storage_line(self, state: dict[str, object]) -> str | None:
         parts: list[str] = []
         docker_data_bytes = state.get("docker_data_bytes")
-        reclaimable_bytes = state.get("reclaimable_bytes")
-        dangling_images = state.get("dangling_images")
-        dangling_volumes = state.get("dangling_volumes")
 
         if isinstance(docker_data_bytes, int) and docker_data_bytes >= 0:
             if docker_data_bytes >= DOCKER_DISPLAY_STORAGE_BYTES:
-                parts.append(f"docker data {format_bytes(docker_data_bytes)}")
-        if isinstance(reclaimable_bytes, int) and reclaimable_bytes > 0:
-            if reclaimable_bytes >= DOCKER_DISPLAY_STORAGE_BYTES:
-                parts.append(f"reclaimable {format_bytes(reclaimable_bytes)}")
-        if isinstance(dangling_images, int) and dangling_images > 0:
-            parts.append(f"{dangling_images} dangling images")
-        if isinstance(dangling_volumes, int) and dangling_volumes > 0:
-            parts.append(f"{dangling_volumes} dangling volumes")
+                parts.append(f"{format_bytes(docker_data_bytes)} data")
         if not parts:
             return None
-        return "Storage: " + " | ".join(parts)
+        total_images = state.get("total_images")
+        total_containers = state.get("total_containers")
+        if isinstance(total_images, int) and total_images > 0:
+            parts.append(f"{total_images} images")
+        if isinstance(total_containers, int) and total_containers > 0:
+            parts.append(f"{total_containers} containers")
+        return "Footprint: " + " | ".join(parts)
+
+    @staticmethod
+    def access_note(access_error: str) -> str:
+        lowered = access_error.lower()
+        if "permission denied" in lowered and ("docker api" in lowered or "docker.sock" in lowered):
+            return "live docker.sock unreadable"
+        return shorten(access_error, 100)
 
     def runtime_line(self, state: dict[str, object]) -> str:
         running = int(state.get("running", 0) or 0)
@@ -534,6 +537,8 @@ class ContainersCollector:
         total_containers = state.get("total_containers")
 
         parts = [f"{running} running"]
+        if isinstance(total_containers, int) and total_containers > 0:
+            parts.append(f"{total_containers} total")
         if unhealthy > 0:
             parts.append(f"{unhealthy} unhealthy")
         if restarting > 0:
@@ -551,12 +556,8 @@ class ContainersCollector:
     def health_line(self, state: dict[str, object]) -> str | None:
         unhealthy = int(state.get("unhealthy", 0) or 0)
         health_starting = int(state.get("health_starting", 0) or 0)
-        healthy = int(state.get("healthy", 0) or 0)
-        missing_healthchecks = state.get("missing_healthchecks")
 
-        if unhealthy <= 0 and health_starting <= 0 and not (
-            isinstance(missing_healthchecks, int) and missing_healthchecks > 0
-        ):
+        if unhealthy <= 0 and health_starting <= 0:
             return None
 
         parts: list[str] = []
@@ -564,13 +565,21 @@ class ContainersCollector:
             parts.append(f"{unhealthy} unhealthy")
         if health_starting > 0:
             parts.append(f"{health_starting} starting")
-        if isinstance(missing_healthchecks, int) and missing_healthchecks > 0:
-            parts.append(f"{missing_healthchecks} without healthchecks")
-        elif healthy > 0 and unhealthy == 0 and health_starting == 0:
-            parts.append(f"{healthy} healthy")
         if not parts:
             return None
         return "Health: " + " | ".join(parts)
+
+    def healthcheck_line(self, state: dict[str, object]) -> str | None:
+        running = int(state.get("running", 0) or 0)
+        missing_healthchecks = state.get("missing_healthchecks")
+        if running <= 0 or not isinstance(missing_healthchecks, int):
+            return None
+        configured = max(running - missing_healthchecks, 0)
+        if missing_healthchecks <= 0:
+            return None
+        if missing_healthchecks < max(2, running // 2):
+            return None
+        return f"Healthchecks: {configured}/{running} running containers define them"
 
     def attention_line(self, state: dict[str, object]) -> str | None:
         parts: list[str] = []
@@ -625,6 +634,25 @@ class ContainersCollector:
             return None
         return "Hotspots: " + " | ".join(parts)
 
+    def cleanup_line(self, state: dict[str, object]) -> str | None:
+        reclaimable_bytes = state.get("reclaimable_bytes")
+        exited = int(state.get("exited", 0) or 0)
+        dangling_images = state.get("dangling_images")
+        dangling_volumes = state.get("dangling_volumes")
+
+        parts: list[str] = []
+        if isinstance(reclaimable_bytes, int) and reclaimable_bytes >= DOCKER_DISPLAY_STORAGE_BYTES:
+            parts.append(f"{format_bytes(reclaimable_bytes)} reclaimable")
+        if exited > 0:
+            parts.append(f"{exited} exited")
+        if isinstance(dangling_images, int) and dangling_images > 0:
+            parts.append(f"{dangling_images} dangling images")
+        if isinstance(dangling_volumes, int) and dangling_volumes > 0:
+            parts.append(f"{dangling_volumes} dangling volumes")
+        if not parts:
+            return None
+        return "Cleanup: " + " | ".join(parts)
+
     def freshness_line(self, state: dict[str, object]) -> str | None:
         stale_30 = state.get("stale_images_30d")
         stale_90 = state.get("stale_images_90d")
@@ -633,7 +661,7 @@ class ContainersCollector:
         parts: list[str] = []
         if isinstance(stale_90, int) and stale_90 > 0:
             parts.append(f"{stale_90} older than 90d")
-        if isinstance(stale_30, int) and stale_30 >= 3:
+        elif isinstance(stale_30, int) and stale_30 >= 3:
             parts.append(f"{stale_30} older than 30d")
         if isinstance(floating, int) and floating > 0:
             parts.append(f"{floating} :latest tag(s)")
@@ -660,7 +688,7 @@ class ContainersCollector:
         )
         if not rendered:
             return None
-        return "Large images: " + rendered
+        return "Largest images: " + rendered
 
     def collect(self) -> list[str]:
         state = self.state()
@@ -683,11 +711,11 @@ class ContainersCollector:
         if state.get("source") == "snapshot":
             access_parts.append("using privileged snapshot")
             if access_error:
-                access_parts.append(shorten(access_error, 100))
+                access_parts.append(self.access_note(access_error))
         elif state.get("available"):
             access_parts.append("daemon reachable")
         elif access_error:
-            access_parts.append(shorten(access_error, 120))
+            access_parts.append(self.access_note(access_error))
         else:
             access_parts.append("unavailable")
         if service_state and (service_state != "active" or state.get("source") == "snapshot"):
@@ -716,6 +744,10 @@ class ContainersCollector:
         if health_line:
             lines.append(health_line)
 
+        healthcheck_line = self.healthcheck_line(state)
+        if healthcheck_line:
+            lines.append(healthcheck_line)
+
         attention_line = self.attention_line(state)
         if attention_line:
             lines.append(attention_line)
@@ -724,13 +756,17 @@ class ContainersCollector:
         if hotspot_line:
             lines.append(hotspot_line)
 
-        storage_line = self.storage_line(state)
-        if storage_line:
-            lines.append(storage_line)
+        cleanup_line = self.cleanup_line(state)
+        if cleanup_line:
+            lines.append(cleanup_line)
 
         freshness_line = self.freshness_line(state)
         if freshness_line:
             lines.append(freshness_line)
+
+        storage_line = self.storage_line(state)
+        if storage_line:
+            lines.append(storage_line)
 
         large_images_line = self.large_images_line(state)
         if large_images_line:
