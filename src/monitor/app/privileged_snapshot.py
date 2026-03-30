@@ -729,6 +729,8 @@ def snapshot_payload() -> dict[str, object]:
     system_state = run_command(["systemctl", "is-system-running"], timeout=3.0)
     route_result = run_command(["ip", "route", "show", "default"], timeout=3.0)
     dns_check_result = run_command(["getent", "ahosts", "archlinux.org"], timeout=3.0)
+    smart = smart_summary()
+    gpu = gpu_telemetry()
     return {
         "snapshot_version": SNAPSHOT_VERSION,
         "generated_at": time.time(),
@@ -769,8 +771,11 @@ def snapshot_payload() -> dict[str, object]:
             ),
         },
         "hardware": {
-            "smart": smart_summary(),
-            "gpu": gpu_telemetry(),
+            # Keep both field names until all privileged readers converge on one schema.
+            "smart": smart,
+            "smart_summary": smart,
+            "gpu": gpu,
+            "gpu_status": gpu,
             "gpu_processes": gpu_processes(),
             "device_counts": device_counts(),
         },
