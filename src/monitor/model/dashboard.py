@@ -57,6 +57,7 @@ class DashboardModel:
             Collector("hardware", "tier2", "Hardware Health", 30, backend.collect_hardware),
             Collector("fs_integrity", "tier2", "Filesystem Integrity", 30, backend.collect_fs_integrity),
             Collector("network", "tier3", "Network State", 30, backend.collect_network),
+            Collector("ethernet", "tier3", "Ethernet Intelligence", 30, backend.collect_ethernet),
             Collector("wifi", "tier3", "Wi-Fi Intelligence", 30, backend.collect_wifi),
             Collector("bluetooth", "tier3", "Bluetooth", 30, backend.collect_bluetooth),
             Collector("security", "tier3", "Security / Exposure Surface", 30, backend.collect_security),

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Sequence
 
 from monitor.shared.command import run_command
-from monitor.shared.constants import WIFI_LOG_PATTERN
+from monitor.shared.constants import ETHERNET_LOG_PATTERN, WIFI_LOG_PATTERN
 from monitor.shared.formatting import first_nonempty_line, format_bytes, format_duration_compact, single_line
 from monitor.shared.parsing_bluetooth import (
     parse_bluetoothctl_devices,
@@ -13,6 +14,7 @@ from monitor.shared.parsing_bluetooth import (
 )
 from monitor.shared.parsing_journal import parse_journal_lines
 from monitor.shared.parsing_network import (
+    parse_ethtool_output,
     parse_iw_channel_details,
     parse_iw_link_output,
     parse_iw_station_dump,
@@ -128,6 +130,341 @@ class NetworkCollector:
             lines.append("Connections: unavailable (socket inspection failed)")
         else:
             lines.append(f"Connections: {established} established | {listening} listening sockets")
+        return lines
+
+
+class EthernetCollector:
+    def __init__(self, backend: object) -> None:
+        self.backend = backend
+
+    @staticmethod
+    def ethernet_interface_sort_key(entry: dict[str, object]) -> tuple[int, int, int, str]:
+        default_route = 0 if entry.get("default_route") else 1
+        connected = 0 if entry.get("connected") else 1
+        carrier = 0 if entry.get("carrier") else 1
+        return (default_route, connected, carrier, str(entry.get("interface", "")))
+
+    @staticmethod
+    def _read_nonnegative_int(path: Path) -> int | None:
+        raw = read_text(path).strip()
+        if not raw:
+            return None
+        value = parse_int(raw, default=-1)
+        return value if value >= 0 else None
+
+    @staticmethod
+    def _default_route_interface(route: str) -> str | None:
+        match = re.search(r"\bdev\s+(\S+)", route)
+        if not match:
+            return None
+        return match.group(1)
+
+    def ethernet_interfaces(self) -> list[str]:
+        root = Path("/sys/class/net")
+        if not root.exists():
+            return []
+        names = []
+        for path in sorted(root.iterdir()):
+            if path.name == "lo":
+                continue
+            if (path / "wireless").exists() or (path / "phy80211").exists():
+                continue
+            if parse_int(read_text(path / "type"), default=0) != 1:
+                continue
+            if not (path / "device").exists():
+                continue
+            names.append(path.name)
+        return names
+
+    def ethernet_logs(self) -> list[str]:
+        pattern = ETHERNET_LOG_PATTERN
+        interfaces = self.ethernet_interfaces()
+        if interfaces:
+            pattern = pattern + "|" + "|".join(re.escape(name) for name in interfaces[:6])
+        result = run_command(
+            [
+                "journalctl",
+                "-b",
+                f"--grep={pattern}",
+                "-n",
+                "12",
+                "--no-pager",
+                "-o",
+                "short-iso",
+            ],
+            timeout=5.0,
+        )
+        return parse_journal_lines(result, limit=8)
+
+    @staticmethod
+    def issue_logs(entries: Sequence[str]) -> list[str]:
+        issue_keywords = (
+            "error",
+            "fail",
+            "failed",
+            "timeout",
+            "reset",
+            "down",
+            "lost",
+            "carrier",
+            "degraded",
+            "flap",
+        )
+        return [entry for entry in entries if any(token in entry.lower() for token in issue_keywords)][:4]
+
+    def live_state(self) -> dict[str, object]:
+        default_route = self.backend.cached("default_route", 60.0, self.backend.network.default_route)
+        default_route_iface = self._default_route_interface(str(default_route))
+        interfaces: list[dict[str, object]] = []
+        for name in self.ethernet_interfaces():
+            sysfs = Path("/sys/class/net") / name
+            carrier = read_text(sysfs / "carrier").strip() == "1"
+            entry: dict[str, object] = {
+                "interface": name,
+                "operstate": read_text(sysfs / "operstate").strip() or "unknown",
+                "carrier": carrier,
+                "connected": carrier,
+                "mac": read_text(sysfs / "address").strip() or "",
+                "mtu": parse_int(read_text(sysfs / "mtu"), default=0),
+                "default_route": name == default_route_iface,
+            }
+            try:
+                entry["driver"] = (sysfs / "device" / "driver").resolve().name
+            except OSError:
+                pass
+
+            speed = self._read_nonnegative_int(sysfs / "speed")
+            if isinstance(speed, int) and speed > 0:
+                entry["speed_mbps"] = speed
+
+            duplex = read_text(sysfs / "duplex").strip().lower()
+            if duplex and "unknown" not in duplex:
+                entry["duplex"] = duplex
+
+            for key in (
+                "carrier_changes",
+                "carrier_up_count",
+                "carrier_down_count",
+            ):
+                value = self._read_nonnegative_int(sysfs / key)
+                if value is not None:
+                    entry[key] = value
+
+            stats_dir = sysfs / "statistics"
+            for key in (
+                "rx_bytes",
+                "tx_bytes",
+                "rx_packets",
+                "tx_packets",
+                "rx_errors",
+                "tx_errors",
+                "rx_dropped",
+                "tx_dropped",
+            ):
+                value = self._read_nonnegative_int(stats_dir / key)
+                if value is not None:
+                    entry[key] = value
+
+            ethtool = run_command(["ethtool", name], timeout=3.0)
+            if ethtool.stdout:
+                entry.update(parse_ethtool_output(ethtool.stdout))
+            interfaces.append(entry)
+
+        logs = self.backend.cached("ethernet_logs", 60.0, self.ethernet_logs)
+        return {
+            "interfaces": interfaces,
+            "logs": logs,
+        }
+
+    def state(self) -> dict[str, object]:
+        privileged = self.backend._privileged_section("ethernet")
+        if privileged:
+            return privileged
+        live = self.backend.cached("ethernet_live_state", 30.0, self.live_state)
+        if isinstance(live, dict):
+            return live
+        return {}
+
+    def summary_line(self, entry: dict[str, object]) -> str:
+        iface = str(entry.get("interface", "ethernet"))
+        operstate = str(entry.get("operstate", "unknown")).strip()
+        speed = entry.get("speed_mbps")
+        duplex = str(entry.get("duplex", "")).strip()
+        parts = [iface]
+        if entry.get("default_route"):
+            parts.append("default route")
+        if entry.get("connected"):
+            parts.append(operstate or "up")
+        else:
+            parts.append("link down")
+        if isinstance(speed, int) and speed > 0:
+            parts.append(f"{speed} Mb/s")
+        if duplex:
+            parts.append(f"{duplex} duplex")
+        return " | ".join(parts)
+
+    @staticmethod
+    def significant_error_count(entry: dict[str, object]) -> int:
+        total = 0
+        for key in ("rx_errors", "tx_errors"):
+            value = entry.get(key)
+            if isinstance(value, int) and value > 0:
+                total += value
+        return total
+
+    @staticmethod
+    def significant_drop_count(entry: dict[str, object]) -> int:
+        total = 0
+        for key in ("rx_dropped", "tx_dropped"):
+            value = entry.get(key)
+            if isinstance(value, int) and value > 0:
+                total += value
+        return total if total >= 10 else 0
+
+    @staticmethod
+    def link_down_count(entry: dict[str, object]) -> int:
+        down_count = entry.get("carrier_down_count")
+        if isinstance(down_count, int) and down_count >= 0:
+            return down_count
+        carrier_changes = entry.get("carrier_changes")
+        if isinstance(carrier_changes, int) and carrier_changes >= 0:
+            return carrier_changes // 2
+        return 0
+
+    def issue_summary(self, entry: dict[str, object]) -> list[str]:
+        if not entry.get("connected"):
+            operstate = str(entry.get("operstate", "unknown")).strip()
+            return [f"link down ({operstate})"]
+
+        issues: list[str] = []
+        speed = entry.get("speed_mbps")
+        duplex = str(entry.get("duplex", "")).strip()
+        autoneg = str(entry.get("autoneg", "")).strip()
+        error_count = self.significant_error_count(entry)
+        drop_count = self.significant_drop_count(entry)
+        down_count = self.link_down_count(entry)
+
+        if isinstance(speed, int) and 0 < speed < 100:
+            issues.append(f"negotiated {speed} Mb/s")
+        if duplex == "half":
+            issues.append("half-duplex")
+        if autoneg == "off":
+            issues.append("autoneg off")
+        if error_count > 0:
+            issues.append(f"{error_count} error counters")
+        if drop_count > 0:
+            issues.append(f"{drop_count} dropped packets")
+        if down_count >= 5:
+            issues.append(f"{down_count} link drops")
+        return issues
+
+    def link_line(self, entry: dict[str, object]) -> str | None:
+        if not entry.get("connected"):
+            return "Link: no carrier"
+        port = str(entry.get("port", "")).strip()
+        autoneg = str(entry.get("autoneg", "")).strip()
+        parts = []
+        if port and port != "twisted pair":
+            parts.append(port)
+        if autoneg == "off":
+            parts.append(f"autoneg {autoneg}")
+        if not parts:
+            return None
+        return "Link: " + " | ".join(parts)
+
+    def health_line(self, entry: dict[str, object], issue_logs: Sequence[str]) -> str:
+        issues = self.issue_summary(entry)
+        if issues:
+            return "Health: " + " | ".join(issues)
+        if issue_logs:
+            return "Health: link up | recent Ethernet warnings present"
+        if entry.get("connected"):
+            speed = entry.get("speed_mbps")
+            if isinstance(speed, int) and speed >= 2500:
+                label = "multi-gig link"
+            elif isinstance(speed, int) and speed >= 1000:
+                label = "gigabit link"
+            elif isinstance(speed, int) and speed > 0:
+                label = f"{speed} Mb/s link"
+            else:
+                label = "link up"
+            return f"Health: stable {label}"
+        return "Health: no carrier"
+
+    def digest(self) -> dict[str, object]:
+        state = self.state()
+        interfaces = state.get("interfaces", [])
+        logs = state.get("logs", [])
+        digest: dict[str, object] = {
+            "present": False,
+            "connected": False,
+        }
+        if isinstance(logs, list):
+            digest["issue_count"] = len(self.issue_logs(logs))
+        if not isinstance(interfaces, list) or not interfaces:
+            return digest
+        parsed = [entry for entry in interfaces if isinstance(entry, dict)]
+        if not parsed:
+            return digest
+        parsed.sort(key=self.ethernet_interface_sort_key)
+        active = parsed[0]
+        digest["present"] = True
+        digest["interface"] = str(active.get("interface", ""))
+        digest["connected"] = bool(active.get("connected"))
+        digest["default_route"] = bool(active.get("default_route"))
+        speed = active.get("speed_mbps")
+        if isinstance(speed, int):
+            digest["speed_mbps"] = speed
+        error_count = self.significant_error_count(active)
+        if error_count:
+            digest["error_count"] = error_count
+        drop_count = self.significant_drop_count(active)
+        if drop_count:
+            digest["drop_count"] = drop_count
+        link_down_count = self.link_down_count(active)
+        if link_down_count:
+            digest["link_down_count"] = link_down_count
+        carrier_changes = active.get("carrier_changes")
+        if isinstance(carrier_changes, int):
+            digest["carrier_changes"] = carrier_changes
+        return digest
+
+    def collect(self) -> list[str]:
+        state = self.state()
+        snapshot_line = self.backend._privileged_snapshot_line() if self.backend._privileged_section("ethernet") else None
+        interfaces = state.get("interfaces", [])
+        logs = state.get("logs", [])
+
+        lines: list[str] = []
+        if snapshot_line:
+            lines.append(snapshot_line)
+
+        parsed = [entry for entry in interfaces if isinstance(entry, dict)] if isinstance(interfaces, list) else []
+        if not parsed:
+            lines.append("No physical Ethernet interfaces detected.")
+            return lines
+
+        parsed.sort(key=self.ethernet_interface_sort_key)
+        issue_logs = self.issue_logs(logs) if isinstance(logs, list) else []
+        for index, entry in enumerate(parsed[:2]):
+            lines.append(self.summary_line(entry))
+            entry_issue_logs = issue_logs if index == 0 else []
+            health_line = self.health_line(entry, entry_issue_logs)
+            if health_line:
+                lines.append("  " + health_line)
+            link_line = self.link_line(entry)
+            if link_line:
+                lines.append("  " + link_line)
+            if index == 0 and issue_logs:
+                lines.append("  Recent Ethernet issues:")
+                for item in issue_logs[:3]:
+                    lines.append(f"    {item}")
+            if index < min(len(parsed[:2]), 2) - 1:
+                lines.append("")
+
+        if not issue_logs and parsed and not self.issue_summary(parsed[0]):
+            return lines
+
         return lines
 
 

@@ -16,11 +16,19 @@ from typing import Sequence
 from monitor.shared.constants import (
     DEFAULT_PRIVILEGED_SNAPSHOT_PATH,
     DEFAULT_PRIVILEGED_SNAPSHOT_MODE,
+    ETHERNET_LOG_PATTERN,
     FS_LOG_PATTERN,
     HARDWARE_LOG_PATTERN,
     PRIVILEGED_SNAPSHOT_VERSION,
     PSEUDO_FILESYSTEMS,
     WIFI_LOG_PATTERN,
+)
+from monitor.shared.parsing_network import (
+    parse_ethtool_output,
+    parse_iw_channel_details,
+    parse_iw_link_output,
+    parse_iw_rate_mbps,
+    parse_rfkill_output,
 )
 from monitor.shared.text import line_list as shared_line_list
 from monitor.shared.text import parse_float, parse_int, read_text
@@ -53,6 +61,15 @@ def command_lines(args: Sequence[str], timeout: float = 6.0, limit: int | None =
     return line_list(result.stdout, limit=limit)
 
 
+def count_command_lines(args: Sequence[str], timeout: float = 5.0) -> int | None:
+    result = run_command(args, timeout=timeout)
+    if result is None:
+        return None
+    if result.returncode == 0 or result.stdout:
+        return len(line_list(result.stdout))
+    return None
+
+
 def detect_ro_mounts() -> list[str]:
     mounts = []
     result = run_command(["findmnt", "-rn", "-o", "TARGET,OPTIONS"], timeout=3.0)
@@ -83,6 +100,21 @@ def dns_servers() -> str:
         if raw.startswith("nameserver "):
             nameservers.append(raw.split(None, 1)[1])
     return ", ".join(nameservers) if nameservers else "no nameservers found"
+
+
+def dns_check(host: str) -> str:
+    result = run_command(["getent", "ahosts", host], timeout=3.0)
+    if result is None:
+        return "resolution failed"
+    if result.stdout:
+        return result.stdout.splitlines()[0].split()[0]
+    if result.stderr:
+        return result.stderr.strip()
+    return "resolution failed"
+
+
+def interface_summary() -> list[str]:
+    return command_lines(["ip", "-brief", "address"], timeout=3.0, limit=8)
 
 
 def smart_summary() -> list[str]:
@@ -226,6 +258,129 @@ def fs_errors() -> list[str]:
     )
 
 
+def default_route_interface(route: str) -> str | None:
+    match = re.search(r"\bdev\s+(\S+)", route)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def read_nonnegative_int(path: Path) -> int | None:
+    raw = read_text(path).strip()
+    if not raw:
+        return None
+    value = parse_int(raw, default=-1)
+    return value if value >= 0 else None
+
+
+def ethernet_interface_names() -> list[str]:
+    root = Path("/sys/class/net")
+    if not root.exists():
+        return []
+    names = []
+    for path in sorted(root.iterdir()):
+        if path.name == "lo":
+            continue
+        if (path / "wireless").exists() or (path / "phy80211").exists():
+            continue
+        if parse_int(read_text(path / "type"), default=0) != 1:
+            continue
+        if not (path / "device").exists():
+            continue
+        names.append(path.name)
+    return names
+
+
+def ethernet_logs(interfaces: Sequence[str]) -> list[str]:
+    pattern = ETHERNET_LOG_PATTERN
+    if interfaces:
+        pattern = pattern + "|" + "|".join(re.escape(name) for name in interfaces[:6])
+    return command_lines(
+        ["journalctl", "-b", f"--grep={pattern}", "-n", "12", "--no-pager", "-o", "short-iso"],
+        timeout=4.0,
+        limit=12,
+    )
+
+
+def ethernet_snapshot(default_route: str) -> dict[str, object]:
+    default_iface = default_route_interface(default_route)
+    interfaces: list[dict[str, object]] = []
+    names = ethernet_interface_names()
+    for name in names:
+        sysfs = Path("/sys/class/net") / name
+        carrier = read_text(sysfs / "carrier").strip() == "1"
+        entry: dict[str, object] = {
+            "interface": name,
+            "operstate": read_text(sysfs / "operstate").strip() or "unknown",
+            "carrier": carrier,
+            "connected": carrier,
+            "mac": read_text(sysfs / "address").strip() or "",
+            "mtu": parse_int(read_text(sysfs / "mtu"), default=0),
+            "default_route": name == default_iface,
+        }
+        try:
+            entry["driver"] = (sysfs / "device" / "driver").resolve().name
+        except OSError:
+            pass
+
+        speed = read_nonnegative_int(sysfs / "speed")
+        if isinstance(speed, int) and speed > 0:
+            entry["speed_mbps"] = speed
+
+        duplex = read_text(sysfs / "duplex").strip().lower()
+        if duplex and "unknown" not in duplex:
+            entry["duplex"] = duplex
+
+        for key in (
+            "carrier_changes",
+            "carrier_up_count",
+            "carrier_down_count",
+        ):
+            value = read_nonnegative_int(sysfs / key)
+            if value is not None:
+                entry[key] = value
+
+        stats_dir = sysfs / "statistics"
+        for key in (
+            "rx_bytes",
+            "tx_bytes",
+            "rx_packets",
+            "tx_packets",
+            "rx_errors",
+            "tx_errors",
+            "rx_dropped",
+            "tx_dropped",
+        ):
+            value = read_nonnegative_int(stats_dir / key)
+            if value is not None:
+                entry[key] = value
+
+        ethtool = run_command(["ethtool", name], timeout=3.0)
+        if ethtool is not None and ethtool.stdout:
+            entry.update(parse_ethtool_output(ethtool.stdout))
+        interfaces.append(entry)
+
+    return {
+        "interfaces": interfaces,
+        "logs": ethernet_logs(names),
+    }
+
+
+def restart_hints() -> list[str]:
+    return command_lines(
+        [
+            "journalctl",
+            "-b",
+            "--grep=Scheduled restart job|Start request repeated too quickly",
+            "-n",
+            "8",
+            "--no-pager",
+        ],
+        timeout=4.0,
+        limit=8,
+    )
+
+
 def parse_proc_net_wireless() -> dict[str, dict[str, object]]:
     stats: dict[str, dict[str, object]] = {}
     lines = read_text(Path("/proc/net/wireless")).splitlines()
@@ -241,8 +396,10 @@ def parse_proc_net_wireless() -> dict[str, dict[str, object]]:
         noise = parse_float(fields[3])
         if link is None or level is None or noise is None:
             continue
+        quality_pct = max(0.0, min(link / 70.0 * 100.0, 100.0))
         stats[iface.strip()] = {
             "link_quality": round(link, 1),
+            "quality_pct": round(quality_pct, 1),
             "signal_dbm": round(level, 1),
             "noise_dbm": round(noise, 1),
             "discard_nwid": parse_int(fields[4]),
@@ -257,80 +414,119 @@ def parse_proc_net_wireless() -> dict[str, dict[str, object]]:
 
 def parse_iw_station_dump(text: str) -> dict[str, object]:
     result: dict[str, object] = {}
+    in_station = False
     for raw in text.splitlines():
         line = raw.strip()
-        if line.startswith("tx bitrate:"):
-            number = parse_float(line)
+        if not line:
+            continue
+        if line.startswith("Station "):
+            if in_station:
+                break
+            in_station = True
+            continue
+        if not in_station or ":" not in line:
+            continue
+        key, value = [part.strip() for part in line.split(":", 1)]
+        lower = key.lower()
+        if lower == "inactive time":
+            number = parse_float(value)
             if number is not None:
-                result["tx_bitrate_mbps"] = number
-        elif line.startswith("rx bitrate:"):
-            number = parse_float(line)
+                result["inactive_ms"] = int(number)
+        elif lower == "connected time":
+            number = parse_float(value)
             if number is not None:
-                result["rx_bitrate_mbps"] = number
-        elif line.startswith("signal avg:"):
-            number = parse_float(line)
+                result["connected_seconds"] = int(number)
+        elif lower == "rx bitrate":
+            bitrate = parse_iw_rate_mbps(value)
+            if bitrate is not None:
+                result["rx_bitrate_mbps"] = bitrate
+        elif lower == "tx bitrate":
+            bitrate = parse_iw_rate_mbps(value)
+            if bitrate is not None:
+                result["tx_bitrate_mbps"] = bitrate
+        elif lower == "signal avg":
+            number = parse_float(value)
             if number is not None:
                 result["signal_avg_dbm"] = number
-        elif line.startswith("tx retries:"):
-            number = parse_float(line)
+        elif lower == "tx retries":
+            number = parse_float(value)
             if number is not None:
-                result["tx_retries"] = number
-        elif line.startswith("tx failed:"):
-            number = parse_float(line)
+                result["tx_retries"] = int(number)
+        elif lower == "tx failed":
+            number = parse_float(value)
             if number is not None:
-                result["tx_failed"] = number
-        elif line.startswith("beacon loss:"):
-            number = parse_float(line)
+                result["tx_failed"] = int(number)
+        elif lower == "beacon loss":
+            number = parse_float(value)
             if number is not None:
-                result["beacon_loss"] = number
+                result["beacon_loss"] = int(number)
+        elif lower == "expected throughput":
+            bitrate = parse_iw_rate_mbps(value)
+            if bitrate is not None:
+                result["expected_throughput_mbps"] = bitrate
+        elif lower == "authorized":
+            result["authorized"] = value.lower() == "yes"
+        elif lower == "authenticated":
+            result["authenticated"] = value.lower() == "yes"
+        elif lower == "associated":
+            result["associated"] = value.lower() == "yes"
+        elif lower == "wmm/wme":
+            result["wmm"] = value.lower() == "yes"
+        elif lower == "mfp":
+            result["mfp"] = value.lower() == "yes"
     return result
 
 
 def wifi_snapshot() -> dict[str, object]:
+    logs = command_lines(
+        ["journalctl", "-b", f"--grep={WIFI_LOG_PATTERN}", "-n", "10", "--no-pager", "-o", "short-iso"],
+        timeout=4.0,
+        limit=10,
+    )
     state: dict[str, object] = {
         "interfaces": [],
         "rfkill": [],
-        "journal": command_lines(
-            ["journalctl", "-b", f"--grep={WIFI_LOG_PATTERN}", "-n", "10", "--no-pager", "-o", "short-iso"],
-            timeout=4.0,
-            limit=10,
-        ),
+        "logs": logs,
+        "journal": logs,
     }
     wireless = parse_proc_net_wireless()
     for path in Path("/sys/class/net").iterdir():
-        if not (path / "wireless").exists():
+        if not ((path / "wireless").exists() or (path / "phy80211").exists()):
             continue
         name = path.name
         sysfs = path
         entry: dict[str, object] = {
+            "interface": name,
             "name": name,
             "operstate": read_text(sysfs / "operstate").strip() or "unknown",
             "mac": read_text(sysfs / "address").strip() or "",
             "carrier": read_text(sysfs / "carrier").strip() == "1",
             "mtu": parse_int(read_text(sysfs / "mtu"), default=0),
         }
+        try:
+            entry["driver"] = (sysfs / "device" / "driver").resolve().name
+        except OSError:
+            pass
         if name in wireless:
             entry.update(wireless[name])
 
         info_result = run_command(["iw", "dev", name, "info"], timeout=3.0)
-        if info_result is not None:
+        if info_result is not None and info_result.stdout:
             for raw in info_result.stdout.splitlines():
                 line = raw.strip()
-                if line.startswith("ssid "):
-                    entry["ssid"] = line.split(None, 1)[1].strip()
-                elif line.startswith("type "):
+                if line.startswith("type "):
                     entry["type"] = line.split(None, 1)[1].strip()
                 elif line.startswith("channel "):
-                    number = parse_int(line)
-                    if number:
-                        entry["channel"] = number
+                    entry.update(parse_iw_channel_details(line))
                 elif line.startswith("txpower "):
                     number = parse_float(line)
                     if number is not None:
+                        entry["tx_power_dbm"] = number
                         entry["txpower_dbm"] = number
 
         link_result = run_command(["iw", "dev", name, "link"], timeout=3.0)
-        if link_result is not None and "Connected to" in link_result.stdout:
+        if link_result is not None and link_result.stdout:
+            entry.update(parse_iw_link_output(link_result.stdout))
             entry["link"] = line_list(link_result.stdout)
 
         station_result = run_command(["iw", "dev", name, "station", "dump"], timeout=4.0)
@@ -338,29 +534,18 @@ def wifi_snapshot() -> dict[str, object]:
             entry.update(parse_iw_station_dump(station_result.stdout))
 
         power_save_result = run_command(["iw", "dev", name, "get", "power_save"], timeout=3.0)
-        if power_save_result is not None:
-            entry["power_save"] = line_list(power_save_result.stdout)
+        if power_save_result is not None and power_save_result.stdout:
+            for raw in power_save_result.stdout.splitlines():
+                line = raw.strip()
+                if line.lower().startswith("power save:"):
+                    entry["power_save"] = line.split(":", 1)[1].strip().lower()
+                    break
 
         state["interfaces"].append(entry)
 
     rfkill_result = run_command(["rfkill", "list"], timeout=3.0)
-    if rfkill_result is not None:
-        current: dict[str, object] | None = None
-        for raw in rfkill_result.stdout.splitlines():
-            if re.match(r"^\d+:", raw):
-                if current:
-                    state["rfkill"].append(current)
-                current = {"name": raw.split(":", 1)[1].strip()}
-            elif current is not None:
-                line = raw.strip()
-                if line.startswith("Soft blocked:"):
-                    current["soft_blocked"] = line.endswith("yes")
-                elif line.startswith("Hard blocked:"):
-                    current["hard_blocked"] = line.endswith("yes")
-                elif line.startswith("Type:"):
-                    current["type"] = line.split(":", 1)[1].strip()
-        if current:
-            state["rfkill"].append(current)
+    if rfkill_result is not None and rfkill_result.stdout:
+        state["rfkill"] = parse_rfkill_output(rfkill_result.stdout)
     return state
 
 
@@ -728,48 +913,84 @@ def docker_snapshot() -> dict[str, object]:
 def snapshot_payload() -> dict[str, object]:
     system_state = run_command(["systemctl", "is-system-running"], timeout=3.0)
     route_result = run_command(["ip", "route", "show", "default"], timeout=3.0)
-    dns_check_result = run_command(["getent", "ahosts", "archlinux.org"], timeout=3.0)
+    default_route = line_list(route_result.stdout)[0] if route_result and route_result.stdout else ""
+    dns_probe_host = "archlinux.org"
+    failed_services = command_lines(
+        ["systemctl", "--failed", "--type=service", "--no-legend", "--no-pager"],
+        timeout=4.0,
+        limit=12,
+    )
+    enabled_services = command_lines(
+        ["systemctl", "list-unit-files", "--type=service", "--state=enabled", "--no-legend", "--no-pager"],
+        timeout=4.0,
+        limit=30,
+    )
+    disabled_services = command_lines(
+        ["systemctl", "list-unit-files", "--type=service", "--state=disabled", "--no-legend", "--no-pager"],
+        timeout=4.0,
+        limit=30,
+    )
+    enabled_count = count_command_lines(
+        ["systemctl", "list-unit-files", "--type=service", "--state=enabled", "--no-legend", "--no-pager"],
+        timeout=4.0,
+    )
+    disabled_count = count_command_lines(
+        ["systemctl", "list-unit-files", "--type=service", "--state=disabled", "--no-legend", "--no-pager"],
+        timeout=4.0,
+    )
+    restart_lines = restart_hints()
+    journal_errors = command_lines(
+        ["journalctl", "-b", "-p", "err", "-n", "10", "--no-pager", "-o", "short-iso"],
+        timeout=4.0,
+        limit=10,
+    )
+    kernel_warnings = command_lines(
+        ["journalctl", "-k", "-b", "-p", "warning", "-n", "10", "--no-pager", "-o", "short-monotonic"],
+        timeout=4.0,
+        limit=10,
+    )
+    hardware_hints = command_lines(
+        ["journalctl", "-b", f"--grep={HARDWARE_LOG_PATTERN}", "-n", "10", "--no-pager", "-o", "short-iso"],
+        timeout=4.0,
+        limit=10,
+    )
     smart = smart_summary()
     gpu = gpu_telemetry()
+    interfaces = interface_summary()
+    dns_check_value = dns_check(dns_probe_host)
+    connections = socket_counts()
+    listeners = listening_sockets()
+    visible = visible_mounts()
+    ro_mounts = detect_ro_mounts()
+    fs_hints = fs_errors()
+    ethernet = ethernet_snapshot(default_route)
+    wifi = wifi_snapshot()
+    systemd: dict[str, object] = {
+        "state": line_list(system_state.stdout)[0] if system_state and system_state.stdout else "unknown",
+        "failed_services": failed_services,
+        "enabled_services": enabled_services,
+        "disabled_services": disabled_services,
+        "enabled_count": enabled_count if enabled_count is not None else "n/a",
+        "disabled_count": disabled_count if disabled_count is not None else "n/a",
+        "restart_hints": restart_lines,
+    }
+    logs: dict[str, object] = {
+        "journal_errors": journal_errors,
+        "kernel_warnings": kernel_warnings,
+        "hardware_hints": hardware_hints,
+        "hardware_warnings": hardware_hints,
+    }
+    filesystem: dict[str, object] = {
+        "visible_mounts": visible,
+        "read_only_mounts": ro_mounts,
+        "fs_errors": fs_hints,
+    }
     return {
         "snapshot_version": SNAPSHOT_VERSION,
         "generated_at": time.time(),
         "hostname": os.uname().nodename,
-        "systemd": {
-            "state": line_list(system_state.stdout)[0] if system_state and system_state.stdout else "unknown",
-            "failed_services": command_lines(
-                ["systemctl", "--failed", "--type=service", "--no-legend", "--no-pager"],
-                timeout=4.0,
-                limit=12,
-            ),
-            "enabled_services": command_lines(
-                ["systemctl", "list-unit-files", "--type=service", "--state=enabled", "--no-legend", "--no-pager"],
-                timeout=4.0,
-                limit=30,
-            ),
-            "disabled_services": command_lines(
-                ["systemctl", "list-unit-files", "--type=service", "--state=disabled", "--no-legend", "--no-pager"],
-                timeout=4.0,
-                limit=30,
-            ),
-        },
-        "logs": {
-            "journal_errors": command_lines(
-                ["journalctl", "-b", "-p", "err", "-n", "10", "--no-pager", "-o", "short-iso"],
-                timeout=4.0,
-                limit=10,
-            ),
-            "kernel_warnings": command_lines(
-                ["journalctl", "-k", "-b", "-p", "warning", "-n", "10", "--no-pager", "-o", "short-monotonic"],
-                timeout=4.0,
-                limit=10,
-            ),
-            "hardware_hints": command_lines(
-                ["journalctl", "-b", f"--grep={HARDWARE_LOG_PATTERN}", "-n", "10", "--no-pager", "-o", "short-iso"],
-                timeout=4.0,
-                limit=10,
-            ),
-        },
+        "systemd": systemd,
+        "logs": logs,
         "hardware": {
             # Keep both field names until all privileged readers converge on one schema.
             "smart": smart,
@@ -780,20 +1001,28 @@ def snapshot_payload() -> dict[str, object]:
             "device_counts": device_counts(),
         },
         "network": {
-            "default_route": line_list(route_result.stdout)[0] if route_result and route_result.stdout else "",
+            "interfaces": interfaces,
+            "default_route": default_route,
             "dns_servers": dns_servers(),
-            "dns_check_ok": bool(dns_check_result and dns_check_result.stdout),
-            "socket_counts": socket_counts(),
-            "listening_sockets": listening_sockets(),
+            "dns_check": dns_check_value,
+            "dns_check_ok": dns_check_value != "resolution failed",
+            "connections": connections,
+            "socket_counts": connections,
+            "listening_sockets": listeners,
         },
-        "filesystem": {
-            "visible_mounts": visible_mounts(),
-            "read_only_mounts": detect_ro_mounts(),
-            "fs_errors": fs_errors(),
+        "ethernet": ethernet,
+        "filesystem": filesystem,
+        "fs_integrity": {
+            "visible_mounts": visible,
+            "ro_mounts": ro_mounts,
+            "read_only_mounts": ro_mounts,
+            "hints": fs_hints,
+            "fs_errors": fs_hints,
         },
         "containers": docker_snapshot(),
-        "wifi": wifi_snapshot(),
+        "wifi": wifi,
         "security": {
+            "listeners": listeners,
             "failed_logins": command_lines(
                 ["journalctl", "-b", "--grep=Failed password|authentication failure|FAILED LOGIN", "-n", "8", "--no-pager", "-o", "short-iso"],
                 timeout=4.0,

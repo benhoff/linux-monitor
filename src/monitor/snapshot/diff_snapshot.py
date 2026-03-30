@@ -129,6 +129,7 @@ class DiffSnapshotService:
                 max_temp = max(max_temp, float(match.group(1)))
 
         snapshot_health = self.privileged_snapshots.health()
+        ethernet_digest = self.backend._ethernet_digest()
         wifi_digest = self.backend._wifi_digest()
         bluetooth_digest = self.backend._bluetooth_digest()
         containers_digest = self.backend._docker_digest()
@@ -193,6 +194,7 @@ class DiffSnapshotService:
                 "age": snapshot_health.get("age"),
             },
             "containers": containers_digest,
+            "ethernet": ethernet_digest,
             "wifi": wifi_digest,
             "bluetooth": bluetooth_digest,
             "capture": {
@@ -375,6 +377,73 @@ class DiffSnapshotService:
 
         current_wifi = current.get("wifi", {})
         previous_wifi = previous.get("wifi", {})
+        current_ethernet = current.get("ethernet", {})
+        previous_ethernet = previous.get("ethernet", {})
+        if isinstance(current_ethernet, dict) and isinstance(previous_ethernet, dict):
+            current_present = bool(current_ethernet.get("present"))
+            previous_present = bool(previous_ethernet.get("present"))
+            current_iface = str(current_ethernet.get("interface", "")).strip()
+            previous_iface = str(previous_ethernet.get("interface", "")).strip()
+            current_connected = bool(current_ethernet.get("connected"))
+            previous_connected = bool(previous_ethernet.get("connected"))
+            iface_label = current_iface or previous_iface or "ethernet"
+
+            if (
+                current_present
+                and previous_present
+                and current_iface
+                and previous_iface
+                and current_iface != previous_iface
+            ):
+                changes.append(f"Ethernet interface: {previous_iface} -> {current_iface}")
+            if (current_present or previous_present) and current_connected != previous_connected:
+                changes.append(
+                    f"Ethernet: link up on {iface_label}"
+                    if current_connected
+                    else f"Ethernet: link down on {iface_label}"
+                )
+
+            current_speed = current_ethernet.get("speed_mbps")
+            previous_speed = previous_ethernet.get("speed_mbps")
+            if (
+                current_connected
+                and previous_connected
+                and isinstance(current_speed, int)
+                and isinstance(previous_speed, int)
+                and current_speed != previous_speed
+            ):
+                changes.append(f"Ethernet speed: {previous_speed} -> {current_speed} Mb/s")
+
+            current_error_count = current_ethernet.get("error_count")
+            previous_error_count = previous_ethernet.get("error_count")
+            if (
+                isinstance(current_error_count, int)
+                and isinstance(previous_error_count, int)
+                and current_error_count > previous_error_count
+            ):
+                delta = current_error_count - previous_error_count
+                changes.append(f"Ethernet errors: +{delta} ({current_error_count} total)")
+
+            current_drop_count = current_ethernet.get("drop_count")
+            previous_drop_count = previous_ethernet.get("drop_count")
+            if (
+                isinstance(current_drop_count, int)
+                and isinstance(previous_drop_count, int)
+                and current_drop_count - previous_drop_count >= 25
+            ):
+                delta = current_drop_count - previous_drop_count
+                changes.append(f"Ethernet drops: +{delta} ({current_drop_count} total)")
+
+            current_link_down_count = current_ethernet.get("link_down_count")
+            previous_link_down_count = previous_ethernet.get("link_down_count")
+            if (
+                isinstance(current_link_down_count, int)
+                and isinstance(previous_link_down_count, int)
+                and current_link_down_count - previous_link_down_count >= 3
+            ):
+                delta = current_link_down_count - previous_link_down_count
+                changes.append(f"Ethernet link drops: +{delta} ({current_link_down_count} total)")
+
         if isinstance(current_wifi, dict) and isinstance(previous_wifi, dict):
             current_connected = bool(current_wifi.get("connected"))
             previous_connected = bool(previous_wifi.get("connected"))

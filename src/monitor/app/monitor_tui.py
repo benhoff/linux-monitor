@@ -53,7 +53,7 @@ from monitor.collectors.boot import BootCollector
 from monitor.collectors.capture import CaptureCollector
 from monitor.collectors.containers import ContainersCollector
 from monitor.collectors.hygiene import HygieneCollector
-from monitor.collectors.networking import BluetoothCollector, NetworkCollector, WifiCollector
+from monitor.collectors.networking import BluetoothCollector, EthernetCollector, NetworkCollector, WifiCollector
 from monitor.collectors.package_monitor import PackageMonitor, PackageRefreshState, PackageUpdateRow
 from monitor.collectors.resources import (
     CpuCollector,
@@ -183,6 +183,7 @@ class MonitorBackend:
         self.containers = ContainersCollector(self)
         self.memory = MemoryCollector(self)
         self.network = NetworkCollector(self)
+        self.ethernet = EthernetCollector(self)
         self.wifi = WifiCollector(self)
         self.bluetooth = BluetoothCollector(self)
         self.cpu = CpuCollector(self)
@@ -442,6 +443,29 @@ class MonitorBackend:
                 problems.append((90, "! Privileged snapshot contents are invalid"))
             elif status == "stale" and isinstance(age, int):
                 problems.append((65, f"? Privileged snapshot is stale ({self._age_label(age)} old)"))
+
+        ethernet = current.get("ethernet", {})
+        if isinstance(ethernet, dict) and ethernet.get("present"):
+            interface = str(ethernet.get("interface", "ethernet")).strip() or "ethernet"
+            connected = bool(ethernet.get("connected"))
+            default_route = bool(ethernet.get("default_route"))
+            error_count = ethernet.get("error_count")
+            drop_count = ethernet.get("drop_count")
+            link_down_count = ethernet.get("link_down_count")
+            issue_count = ethernet.get("issue_count")
+            if default_route and not connected:
+                problems.append((85, f"! Default-route Ethernet link is down on {interface}"))
+            if connected and isinstance(error_count, int) and error_count > 0:
+                severity = 85 if default_route else 70
+                problems.append((severity, f"! Ethernet on {interface} reports {error_count} error counter(s)"))
+            if connected and isinstance(drop_count, int) and drop_count >= 25:
+                severity = 70 if default_route else 55
+                problems.append((severity, f"? Ethernet on {interface} has {drop_count} dropped packets"))
+            if isinstance(link_down_count, int) and link_down_count >= 5 and isinstance(issue_count, int) and issue_count > 0:
+                severity = 70 if default_route else 55
+                problems.append((severity, f"? Ethernet on {interface} has dropped link {link_down_count} time(s)"))
+            if isinstance(issue_count, int) and issue_count >= 3 and not connected:
+                problems.append((45, f"? Ethernet journal shows {issue_count} recent issue hints for {interface}"))
 
         wifi = current.get("wifi", {})
         if isinstance(wifi, dict):
@@ -928,6 +952,18 @@ class MonitorBackend:
 
     def collect_bluetooth(self) -> list[str]:
         return self.bluetooth.collect()
+
+    def _live_ethernet_state(self) -> dict[str, object]:
+        return self.ethernet.live_state()
+
+    def _ethernet_state(self) -> dict[str, object]:
+        return self.ethernet.state()
+
+    def _ethernet_digest(self) -> dict[str, object]:
+        return self.ethernet.digest()
+
+    def collect_ethernet(self) -> list[str]:
+        return self.ethernet.collect()
 
     def collect_wifi(self) -> list[str]:
         return self.wifi.collect()

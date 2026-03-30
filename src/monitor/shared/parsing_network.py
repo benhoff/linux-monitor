@@ -47,6 +47,35 @@ def parse_iw_rate_mbps(raw: str) -> float | None:
         return None
 
 
+def parse_ethtool_output(text: str) -> dict[str, object]:
+    state: dict[str, object] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = [part.strip() for part in line.split(":", 1)]
+        lower = key.lower()
+        if lower == "speed":
+            speed = parse_int(value, default=-1)
+            if speed > 0:
+                state["speed_mbps"] = speed
+        elif lower == "duplex":
+            duplex = value.lower()
+            if duplex and "unknown" not in duplex:
+                state["duplex"] = duplex
+        elif lower == "auto-negotiation":
+            autoneg = value.lower()
+            if autoneg:
+                state["autoneg"] = autoneg
+        elif lower == "port":
+            port = value.lower()
+            if port:
+                state["port"] = port
+        elif lower == "link detected":
+            state["connected"] = value.lower() == "yes"
+    return state
+
+
 def parse_proc_net_wireless_text(text: str) -> dict[str, dict[str, object]]:
     stats: dict[str, dict[str, object]] = {}
     for raw in text.splitlines()[2:]:
