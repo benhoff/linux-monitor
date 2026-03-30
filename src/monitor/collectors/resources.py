@@ -12,7 +12,7 @@ from monitor.shared.parsing_journal import detect_ro_mounts, parse_journal_lines
 from monitor.shared.text import line_list, parse_int, read_lines, read_text, shorten
 
 
-THROTTLE_LOG_PATTERN = r"throttl|thermal"
+THROTTLE_LOG_PATTERN = r"throttl|thermal|overheat|critical temperature|clock limit"
 
 
 class MemoryCollector:
@@ -64,26 +64,41 @@ class MemoryCollector:
             timeout=5.0,
         )
 
-        lines = [
-            f"RAM: {format_bytes(used)} used / {format_bytes(total)} total ({format_percent(used, total)})",
-            f"Available: {format_bytes(available)} | Free: {format_bytes(free)} | Buffers/cache: {format_bytes(buffers + cached)}",
-            f"Swap: {format_bytes(swap_used)} used / {format_bytes(swap_total)} total ({format_percent(swap_used, swap_total)})",
-        ]
+        used_pct = (used / total * 100.0) if total else 0.0
+        psi_some10 = float(psi.get("some", {}).get("avg10", 0.0))
+        psi_full10 = float(psi.get("full", {}).get("avg10", 0.0))
+        oom_lines = parse_journal_lines(oom_events, limit=4)
+        has_oom_signal = any(item != "No matching entries." for item in oom_lines)
+
+        lines = [f"RAM: {format_bytes(used)} used / {format_bytes(total)} total ({format_percent(used, total)})"]
+        if used_pct >= 70.0 or swap_used > 0 or psi_some10 > 0.0 or psi_full10 > 0.0:
+            lines.append(
+                f"Available: {format_bytes(available)} | Free: {format_bytes(free)} | Buffers/cache: {format_bytes(buffers + cached)}"
+            )
+        if swap_total > 0:
+            swap_label = f"{format_bytes(swap_used)} used / {format_bytes(swap_total)} total ({format_percent(swap_used, swap_total)})"
+            if swap_used == 0:
+                swap_label += " | idle"
+            lines.append(f"Swap: {swap_label}")
 
         some = psi.get("some", {})
         full = psi.get("full", {})
         if some or full:
-            lines.append(
-                "PSI memory: "
-                f"some {some.get('avg10', 0.0):.2f}/{some.get('avg60', 0.0):.2f}/{some.get('avg300', 0.0):.2f} "
-                f"| full {full.get('avg10', 0.0):.2f}/{full.get('avg60', 0.0):.2f}/{full.get('avg300', 0.0):.2f}"
-            )
+            if psi_some10 > 0.0 or psi_full10 > 0.0:
+                lines.append(
+                    "PSI memory: "
+                    f"some {some.get('avg10', 0.0):.2f}/{some.get('avg60', 0.0):.2f}/{some.get('avg300', 0.0):.2f} "
+                    f"| full {full.get('avg10', 0.0):.2f}/{full.get('avg60', 0.0):.2f}/{full.get('avg300', 0.0):.2f}"
+                )
+            else:
+                lines.append("PSI memory: clean")
         else:
             lines.append("PSI memory: unavailable.")
 
-        lines.append("OOM events:")
-        for item in parse_journal_lines(oom_events, limit=4):
-            lines.append(f"  {item}")
+        if has_oom_signal:
+            lines.append("OOM events:")
+            for item in oom_lines:
+                lines.append(f"  {item}")
         return lines
 
 
@@ -149,7 +164,42 @@ class CpuCollector:
 
     def top_processes(self) -> list[str]:
         result = run_command(["ps", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu", "--no-headers"], timeout=3.0)
-        return line_list(result.stdout, limit=5)
+        rows: list[str] = []
+        for raw in line_list(result.stdout):
+            parts = raw.split()
+            if len(parts) < 4:
+                continue
+            pid, comm, cpu_pct, mem_pct = parts[:4]
+            lowered = comm.lower()
+            if lowered in {"ps", "bash", "sh", "timeout", "bwrap"}:
+                continue
+            rows.append(f"{pid} {comm:12} {cpu_pct:>5} {mem_pct:>4}")
+            if len(rows) >= 5:
+                break
+        return rows
+
+    @staticmethod
+    def throttle_issue_lines(entries: list[str]) -> list[str]:
+        issue_keywords = (
+            "throttl",
+            "clock limit",
+            "temperature above",
+            "critical temperature",
+            "overheat",
+            "power limit",
+        )
+        ignored_keywords = (
+            "registered thermal governor",
+            "interrupt throttling rate",
+        )
+        issues = []
+        for entry in entries:
+            lowered = entry.lower()
+            if any(token in lowered for token in ignored_keywords):
+                continue
+            if any(token in lowered for token in issue_keywords):
+                issues.append(entry)
+        return issues[:4]
 
     def collect(self) -> list[str]:
         loadavg = read_text(Path("/proc/loadavg")).split()
@@ -163,13 +213,26 @@ class CpuCollector:
             f"Load average: {' '.join(loadavg[:3]) if loadavg else 'unavailable'}",
             f"CPU usage: user {user_pct:.1f}% | system {system_pct:.1f}% | iowait {iowait_pct:.1f}%",
             f"CPU frequency: {self.cpu_frequency()}",
-            "Top CPU processes:",
         ]
+        cpu_total = user_pct + system_pct + iowait_pct
+        active_processes = []
         for item in top_processes[:5]:
-            lines.append(f"  {item}")
-        lines.append("Throttle hints:")
-        for item in parse_journal_lines(throttle_hints, limit=4):
-            lines.append(f"  {item}")
+            parts = item.split()
+            if len(parts) >= 3:
+                try:
+                    if float(parts[2]) >= 10.0:
+                        active_processes.append(item)
+                except ValueError:
+                    continue
+        if cpu_total >= 20.0 and active_processes:
+            lines.append("Top CPU processes:")
+            for item in active_processes[:4]:
+                lines.append(f"  {item}")
+        throttle_entries = self.throttle_issue_lines(parse_journal_lines(throttle_hints, limit=8))
+        if throttle_entries:
+            lines.append("Throttle hints:")
+            for item in throttle_entries:
+                lines.append(f"  {item}")
         return lines
 
 
@@ -240,31 +303,29 @@ class ThermalCollector:
         return ["No GPU telemetry available."]
 
     def collect(self) -> list[str]:
-        lines = ["Thermal zones:"]
         zones = self.thermal_zones()
+        lines = ["Thermal zones:"]
         if zones:
             for item in zones[:6]:
                 lines.append(f"  {item}")
         else:
             lines.append("  No readable thermal zones.")
         fans = self.fans()
-        lines.append("Fan speeds:")
         if fans:
+            lines.append("Fan speeds:")
             for item in fans[:6]:
                 lines.append(f"  {item}")
-        else:
-            lines.append("  No readable fan sensors.")
         power_states = self.power_state()
-        lines.append("Power supplies:")
         if power_states:
+            lines.append("Power supplies:")
             for item in power_states[:4]:
                 lines.append(f"  {item}")
-        else:
-            lines.append("  No battery or AC state exposed.")
         if self.backend.nvidia_monitoring_enabled():
-            lines.append("GPU thermal / power:")
-            for item in self.gpu_telemetry()[:4]:
-                lines.append(f"  {item}")
+            gpu_items = self.gpu_telemetry()[:4]
+            if gpu_items and gpu_items[0] != "No GPU telemetry available.":
+                lines.append("GPU thermal / power:")
+                for item in gpu_items:
+                    lines.append(f"  {item}")
         return lines
 
 
@@ -368,11 +429,6 @@ class HardwareCollector:
                 lines.append("GPU processes:")
                 for item in gpu_processes[:4]:
                     lines.append(f"  {item}")
-            device_counts = privileged.get("device_counts", [])
-            if isinstance(device_counts, list) and device_counts:
-                lines.append("Bus inventory:")
-                for item in device_counts[:4]:
-                    lines.append(f"  {item}")
             return lines
 
         lines = ["SMART summary:"]
@@ -386,11 +442,6 @@ class HardwareCollector:
             lines.append("GPU processes:")
             for item in gpu_processes[:4]:
                 lines.append(f"  {item}")
-        device_counts = self.backend.cached("device_counts", 120.0, self.device_counts)
-        if device_counts:
-            lines.append("Bus inventory:")
-            for item in device_counts[:4]:
-                lines.append(f"  {item}")
         return lines
 
 
@@ -398,33 +449,46 @@ class FilesystemIntegrityCollector:
     def __init__(self, backend: object) -> None:
         self.backend = backend
 
+    @staticmethod
+    def visible_ro_mounts(mounts: list[str]) -> list[str]:
+        hidden_prefixes = (
+            "/run/credentials/",
+            "/proc/",
+            "/sys/",
+            "/dev/",
+        )
+        return [mount for mount in mounts if mount and not mount.startswith(hidden_prefixes)]
+
     def collect(self) -> list[str]:
         privileged = self.backend._privileged_section("fs_integrity")
         if privileged:
             ro_mounts = privileged.get("ro_mounts", [])
             hints = privileged.get("hints", [])
+            visible_ro = self.visible_ro_mounts(ro_mounts) if isinstance(ro_mounts, list) else []
             lines = []
             snapshot_line = self.backend._privileged_snapshot_line()
             if snapshot_line:
                 lines.append(snapshot_line)
-            lines.append("Read-only mounts: " + (", ".join(ro_mounts) if isinstance(ro_mounts, list) and ro_mounts else "none"))
-            lines.append("Filesystem integrity hints:")
+            lines.append("Read-only mounts: " + (", ".join(visible_ro) if visible_ro else "none"))
             if isinstance(hints, list) and hints:
+                lines.append("Filesystem integrity hints:")
                 for item in hints[:6]:
                     lines.append(f"  {item}")
-            else:
-                lines.append("  No matching entries.")
+            elif not visible_ro:
+                lines.append("Filesystem integrity: no error hints in current boot journal.")
             return lines
 
-        ro_mounts = detect_ro_mounts()
+        ro_mounts = self.visible_ro_mounts(detect_ro_mounts())
         journal_fs = run_command(
             ["journalctl", "-b", f"--grep={FS_LOG_PATTERN}", "-n", "10", "--no-pager", "-o", "short-iso"],
             timeout=5.0,
         )
-        lines = [
-            "Read-only mounts: " + (", ".join(ro_mounts) if ro_mounts else "none"),
-            "Filesystem integrity hints:",
-        ]
-        for item in parse_journal_lines(journal_fs, limit=6):
-            lines.append(f"  {item}")
+        hint_lines = parse_journal_lines(journal_fs, limit=6)
+        lines = ["Read-only mounts: " + (", ".join(ro_mounts) if ro_mounts else "none")]
+        if any(item != "No matching entries." for item in hint_lines):
+            lines.append("Filesystem integrity hints:")
+            for item in hint_lines:
+                lines.append(f"  {item}")
+        elif not ro_mounts:
+            lines.append("Filesystem integrity: no error hints in current boot journal.")
         return lines

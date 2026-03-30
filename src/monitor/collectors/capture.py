@@ -471,12 +471,8 @@ class CaptureCollector:
             lines.append("  Connected links: none")
         lines.append("  Encoders: " + self.encoder_summary(encoders))
 
-        lines.append("Capture log issues:")
         if capture_log_issues:
+            lines.append("Capture log issues:")
             for item in capture_log_issues[:3]:
                 lines.append(f"  {item}")
-        elif log_hints:
-            lines.append("  No AVMatrix warnings in current boot journal.")
-        else:
-            lines.append("  No AVMatrix journal entries found this boot.")
         return lines
